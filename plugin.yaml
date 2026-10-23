@@ -1,48 +1,43 @@
-manifest_version: 1
+manifest_version: 2
 name: hermes-hindsight-plus
 version: 0.1.0
 description: >-
   Inject Hindsight mental models into the first turn of every conversation,
   replacing hand-maintained MEMORY.md / USER.md files with stable,
   cron-refreshed context from your Hindsight bank.
+author: atostivint
+license: MIT
+homepage: https://github.com/atostivint/hermes-hindsight-plus
+tags:
+  - memory
+  - context
+  - hindsight
+  - mental-models
+provides_hooks:
+  - pre_llm_call
 config_schema:
-  type: object
-  properties:
-    mode:
-      type: string
-      title: Injection mode
-      description: When to inject the mental models into the conversation.
-      enum: [first_turn, every_turn, off]
-      default: first_turn
-    mental_model_ids:
-      type: array
-      title: Mental model IDs
-      description: Hindsight mental model IDs to inject, concatenated in order.
-      items:
-        type: string
-      default: ["operator-context"]
-    max_chars:
-      type: integer
-      title: Max characters
-      description: Truncation budget for the assembled injection (incl. marker).
-      minimum: 1
-      default: 6000
-    cache_ttl_s:
-      type: integer
-      title: Cache TTL (seconds)
-      description: Seconds a cached mental model stays fresh (no network call).
-      minimum: 0
-      default: 21600
-    timeout_s:
-      type: number
-      title: HTTP timeout (seconds)
-      description: Hard socket timeout for Hindsight HTTP requests.
-      minimum: 0.1
-      default: 3.0
-    skip_platforms:
-      type: array
-      title: Skip platforms
-      description: Platforms on which no injection happens.
-      items:
-        type: string
-      default: ["cron"]
+  mode:
+    type: str
+    description: When to inject the mental models into the conversation.
+    choices: ["first_turn", "every_turn", "off"]
+    default: first_turn
+  mental_model_ids:
+    type: list
+    description: Hindsight mental model IDs to inject, concatenated in order.
+    default: ["operator-context"]
+  max_chars:
+    type: int
+    description: Truncation budget for the assembled injection (including the marker).
+    default: 6000
+  cache_ttl_s:
+    type: int
+    description: Seconds a cached mental model stays fresh (no network call).
+    default: 21600
+  timeout_s:
+    type: float
+    description: Total wall-clock budget for the whole injection attempt (all models).
+    default: 3.0
+  skip_platforms:
+    type: list
+    description: Platforms on which no injection happens.
+    default: ["cron"]

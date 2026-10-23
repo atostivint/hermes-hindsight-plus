@@ -95,6 +95,17 @@ def test_off_is_cheap_no_io(plugin, core, monkeypatch, tmp_path):
     assert calls == []
 
 
+def test_unquoted_off_boolean_is_treated_as_off(plugin, core, monkeypatch, tmp_path):
+    _setup_env(monkeypatch, tmp_path)
+    calls = []
+    monkeypatch.setattr(core, "_http_get_json", _fake_transport(calls, fail=True))
+
+    # Hermes parses YAML 1.1: an unquoted `mode: off` in config.yaml is False.
+    state = plugin._State(_make_config(mode=False))
+    assert plugin._hook(state, session_id="s1", is_first_turn=True, platform="chat") is None
+    assert calls == []
+
+
 def test_empty_ids_is_cheap_no_io(plugin, core, monkeypatch, tmp_path):
     _setup_env(monkeypatch, tmp_path)
     calls = []
@@ -122,6 +133,13 @@ def test_truncate_noop_when_short(core):
     assert core.truncate(text, 1000, ["operator-context"]) == text
 
 
+def test_truncate_respects_tiny_max_chars(core):
+    text = "a" * 100
+    for limit in (1, 5, 20):
+        out = core.truncate(text, limit, ["operator-context"])
+        assert len(out) <= limit
+
+
 def test_cache_hit_performs_no_http(plugin, core, monkeypatch, tmp_path):
     cache_dir = _setup_env(monkeypatch, tmp_path)
     cache_dir.mkdir(parents=True)
@@ -145,6 +163,87 @@ def test_cache_hit_performs_no_http(plugin, core, monkeypatch, tmp_path):
     assert text is not None
     assert "cached content here" in text
     assert calls == []
+
+
+def test_mental_model_url_uses_v1_default_and_content_detail(plugin, core, monkeypatch, tmp_path):
+    _setup_env(monkeypatch, tmp_path)
+    seen = []
+
+    def transport(url, timeout_s, api_key):
+        seen.append((url, timeout_s, api_key))
+        return {
+            "id": "operator-context",
+            "name": "Stable operating context",
+            "content": "hello",
+            "last_refreshed_at": _iso(NOW),
+            "is_stale": False,
+        }
+
+    monkeypatch.setattr(core, "_http_get_json", transport)
+    text = core.build_injection(_make_config())
+    assert text is not None
+    assert len(seen) == 1
+    url, timeout_s, _key = seen[0]
+    assert "/v1/default/banks/bank-1/mental-models/operator-context" in url
+    assert "detail=content" in url
+    assert 0 < timeout_s <= 3.0
+
+
+def test_live_http_round_trip(plugin, core, monkeypatch, tmp_path):
+    import http.server
+    import threading
+
+    seen = {}
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            seen["path"] = self.path
+            seen["auth"] = self.headers.get("Authorization")
+            body = json.dumps(
+                {
+                    "id": "operator-context",
+                    "name": "Stable operating context",
+                    "content": "live content",
+                    "last_refreshed_at": _iso(NOW),
+                    "is_stale": False,
+                }
+            ).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args):
+            pass
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setenv("HINDSIGHT_API_URL", f"http://127.0.0.1:{server.server_port}")
+        monkeypatch.setenv("HINDSIGHT_BANK_ID", "bank-1")
+        monkeypatch.setenv("HINDSIGHT_API_KEY", "sk-live-secret")
+
+        text = core.build_injection(_make_config())
+        assert text is not None
+        assert "live content" in text
+        assert seen["path"] == (
+            "/v1/default/banks/bank-1/mental-models/operator-context?detail=content"
+        )
+        assert seen["auth"] == "Bearer sk-live-secret"
+
+        cache_file = (
+            tmp_path / "plugin-data" / "hermes-hindsight-plus"
+            / "bank-1--operator-context.json"
+        )
+        assert cache_file.exists()
+        assert "sk-live-secret" not in cache_file.read_text("utf-8")
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
 
 
 def test_stale_cache_fallback_on_http_error(plugin, core, monkeypatch, tmp_path):
@@ -225,9 +324,12 @@ def test_register_wires_hook(plugin, core, monkeypatch, tmp_path):
     monkeypatch.setattr(core, "_http_get_json", _fake_transport(calls))
 
     class FakeCtx:
-        def __init__(self):
-            self.config = {}
+        def __init__(self, settings=None):
+            self.settings = dict(settings or {})
             self.hooks = {}
+
+        def get_config(self, key, default=None):
+            return self.settings.get(key, default)
 
         def register_hook(self, name, callback):
             self.hooks[name] = callback
@@ -246,6 +348,37 @@ def test_register_wires_hook(plugin, core, monkeypatch, tmp_path):
     )
     assert result == {"context": result["context"]}
     assert "Stable operating context" in result["context"]
+
+
+def test_register_reads_ctx_get_config_and_opts_into_kwargs(plugin, core, monkeypatch, tmp_path):
+    import inspect
+
+    _setup_env(monkeypatch, tmp_path)
+    calls = []
+    monkeypatch.setattr(core, "_http_get_json", _fake_transport(calls, fail=True))
+
+    class FakeCtx:
+        def __init__(self, settings):
+            self.settings = settings
+            self.hooks = {}
+
+        def get_config(self, key, default=None):
+            return self.settings.get(key, default)
+
+        def register_hook(self, name, callback):
+            self.hooks[name] = callback
+
+    ctx = FakeCtx({"mode": "off"})
+    plugin.register(ctx)
+    hook = ctx.hooks["pre_llm_call"]
+
+    # A **kwargs signature is what Hermes' additive hook contract expects.
+    kinds = {p.kind for p in inspect.signature(hook).parameters.values()}
+    assert inspect.Parameter.VAR_KEYWORD in kinds
+
+    # ctx.get_config("mode") == "off" must win over the default.
+    assert hook(session_id="s1", is_first_turn=True, platform="chat") is None
+    assert calls == []
 
 
 def test_config_json_resolution_and_bearer_key(plugin, core, monkeypatch, tmp_path):

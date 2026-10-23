@@ -70,14 +70,25 @@ environment variables `HINDSIGHT_API_URL`, `HINDSIGHT_BANK_ID`, and `HINDSIGHT_A
 
 ## Configuration
 
+Settings live under `plugins.entries.hermes-hindsight-plus.settings` in `config.yaml`.
+They are also rendered as a form in the Desktop app under **Capabilities → Plugins**
+(the gear on this plugin's row), driven by the manifest's `config_schema`:
+
+```bash
+hermes config set plugins.entries.hermes-hindsight-plus.settings.mode first_turn
+```
+
 | Key               | Default            | Description                                                       |
 |-------------------|--------------------|-------------------------------------------------------------------|
 | `mode`            | `first_turn`       | `first_turn`, `every_turn`, or `off`.                             |
 | `mental_model_ids`| `["operator-context"]` | Hindsight mental model ids to inject, concatenated in order.  |
 | `max_chars`       | `6000`             | Truncation budget for the assembled injection (incl. marker).     |
 | `cache_ttl_s`     | `21600`            | Seconds a cached model stays fresh (no network call).             |
-| `timeout_s`       | `3.0`              | Hard socket timeout for Hindsight HTTP requests.                  |
+| `timeout_s`       | `3.0`              | Total wall-clock budget for the whole injection attempt.          |
 | `skip_platforms`  | `["cron"]`         | Platforms on which no injection happens.                          |
+
+> Hermes parses YAML 1.1, where an unquoted `off` is the boolean `false`. The plugin
+> normalizes both forms, but quoting it (`mode: "off"`) is clearest in `config.yaml`.
 
 ## Behaviour notes
 
@@ -91,7 +102,7 @@ environment variables `HINDSIGHT_API_URL`, `HINDSIGHT_BANK_ID`, and `HINDSIGHT_A
   parse error it falls back to the stale cache (age surfaced in the header); with no cache
   it injects nothing and logs a warning. The API key is never written to disk or logs.
 - **Fail-open & non-blocking:** the hook catches all exceptions, logs, and returns `None`;
-  it never raises and never blocks a turn longer than `timeout_s`.
+  it never raises, and the whole attempt (all models) shares one `timeout_s` budget.
 - **No double injection:** a bounded per-session guard ensures a retried first turn does
   not inject the context twice.
 
@@ -103,11 +114,23 @@ environment variables `HINDSIGHT_API_URL`, `HINDSIGHT_BANK_ID`, and `HINDSIGHT_A
   refreshed mid-conversation.
 - **No write access to the bank.** This plugin is strictly read-only and never creates,
   updates, or deletes mental models in Hindsight.
-- **JSON-only, no dashboard UI.** Configuration is via `config.yaml` / the plugin settings
-  fields rendered from `config_schema`; there is no separate web dashboard.
+- **No custom dashboard.** Settings use the standard plugin settings form rendered from
+  `config_schema` (Desktop **Capabilities → Plugins**, or `config.yaml`); there is no
+  separate web dashboard.
 - **Reads a pre-existing Hindsight setup.** It assumes the official Hindsight plugin (or an
   equivalent `config.json`) already exposes `api_url` / `bank_id`; it does not bootstrap
   Hindsight itself.
+
+## Compatibility
+
+Validated against the live Hermes loader (`hermes_cli.plugin_validate`, the same code path
+as `hermes plugins validate` / the plugin-catalog admission CI):
+
+- manifest v2 parses, `config_schema` shape is valid, and the settings form renders all
+  six keys with the right defaults and `mode` choices;
+- the capability probe imports the plugin, runs `register()` in isolation, and confirms the
+  declared `pre_llm_call` hook matches what is actually registered;
+- the security scan is `safe` and the plugin-host isolation verdict is `host` (host-ready).
 
 ## Development
 
@@ -117,3 +140,4 @@ Stdlib only, no third-party runtime dependency. Target Python 3.11+.
 python -m compileall .
 python -m pytest -q
 ```
+

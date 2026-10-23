@@ -5,8 +5,8 @@ the first turn of every conversation, replacing hand-maintained `MEMORY.md` / `U
 
 ## Hard constraints (do not violate)
 
-- **Stdlib only.** `json`, `urllib.request`, `pathlib`, `threading`, `time`, `logging`, `os`.
-  No third-party runtime dependency. Target Python 3.11+.
+- **Stdlib only.** `json`, `urllib.request` / `urllib.parse`, `pathlib`, `threading`,
+  `time`, `logging`, `os`, `datetime`. No third-party runtime dependency. Target Python 3.11+.
 - **Never log or persist the API key.** The key comes from `HINDSIGHT_API_KEY` or
   `hindsight/config.json`'s `api_key`. Keep it out of logs, out of the injected text, and
   out of the on-disk cache.
@@ -21,12 +21,28 @@ the first turn of every conversation, replacing hand-maintained `MEMORY.md` / `U
 
 ## Layout
 
-- `__init__.py` — entry point (`register`), config resolution, the hook, the per-session
-  guard. Loaded as a package; keep `from . import core` (the directory name has a hyphen,
-  so the module is not importable by its on-disk name).
+- `__init__.py` — entry point (`register`), config resolution via
+  `ctx.get_config(key, default)`, the hook, the per-session guard. Loaded as a package;
+  keep `from . import core` (the directory name has a hyphen, so the module is not
+  importable by its on-disk name).
 - `core.py` — endpoint resolution, HTTP transport, cache read/write, truncation, header,
-  and `build_injection`.
+  and `build_injection`. Uses `plugins.plugin_storage.plugin_data_dir` when running inside
+  Hermes and falls back to `<HERMES_HOME>/plugin-data/<id>/` otherwise.
+- `plugin.yaml` — manifest v2: `provides_hooks: [pre_llm_call]` and a `config_schema`
+  **mapping** of `key -> {type, description, default, choices?}` (not JSON-Schema
+  `properties`). Hermes parses YAML 1.1, so quote `"off"` in `choices`.
 - `tests/` — pytest suite. `conftest.py` loads the package under a valid module name.
+
+## Live Hermes integration
+
+Reference checkout: `the local Hermes Agent checkout`. Relevant surfaces:
+
+- `plugins.entries.<id>.settings.<key>` is read through `ctx.get_config`.
+- `pre_llm_call` receives `is_first_turn`, `session_id`, `platform`, `turn_id`, etc.;
+  return `{"context": "..."}` to append to the current user message.
+- `hermes plugins validate <dir>` (admission) and `hermes plugins doctor <dir>` run a
+  capability probe against a recording context. The plugin must import cleanly, declare
+  `provides_hooks`, and perform no I/O during `register()`.
 
 ## Commands
 
@@ -37,5 +53,6 @@ python -m pytest -q
 
 ## Repo rules
 
-- Work only inside this repo. No remote, never push, never create a GitHub repo.
+- Work only inside this repo. The private remote is
+  `origin` = `https://github.com/atostivint/hermes-hindsight-plus` (never public).
 - Commit to `main` with a clear message.

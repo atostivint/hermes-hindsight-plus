@@ -9,7 +9,6 @@ See README.md for configuration and behaviour.
 
 from __future__ import annotations
 
-import functools
 import logging
 import threading
 
@@ -64,8 +63,48 @@ class _State:
         self.guard = _SessionGuard()
 
 
+def _normalize_mode(value):
+    """Return ``first_turn``, ``every_turn`` or ``off``.
+
+    Hermes parses YAML 1.1, so an unquoted ``mode: off`` in ``config.yaml``
+    arrives as the boolean ``False`` (and ``mode: on`` as ``True``). Normalize
+    those, plus the obvious aliases, before the hot-path checks.
+    """
+    if isinstance(value, bool):
+        return "off" if value is False else "first_turn"
+    text = str(value).strip().lower() if value is not None else ""
+    if text in {"off", "false", "0", "no", "none", "disabled"}:
+        return "off"
+    if text in {"every_turn", "every-turn", "always", "all"}:
+        return "every_turn"
+    return "first_turn"
+
+
 def _get_config(ctx):
+    """Read this plugin's settings, preferring Hermes' ``ctx.get_config`` API.
+
+    ``ctx.get_config(key, default)`` reads ``plugins.entries.<id>.settings.<key>``
+    in the active profile's ``config.yaml``. Older/foreign contexts that only
+    expose a ``config`` mapping still work.
+    """
     merged = dict(DEFAULTS)
+
+    getter = getattr(ctx, "get_config", None)
+    if callable(getter):
+        for key, default in DEFAULTS.items():
+            try:
+                value = getter(key, default=default)
+            except TypeError:  # very old context without the keyword form
+                try:
+                    value = getter(key, default)
+                except Exception:
+                    continue
+            except Exception:
+                continue
+            if value is not None:
+                merged[key] = value
+        return merged
+
     try:
         raw = getattr(ctx, "config", None)
     except Exception:
@@ -73,7 +112,7 @@ def _get_config(ctx):
 
     if isinstance(raw, dict):
         for key in merged:
-            if key in raw and raw[key] is not None:
+            if raw.get(key) is not None:
                 merged[key] = raw[key]
     elif raw is not None and hasattr(raw, "get"):
         for key in merged:
@@ -88,31 +127,42 @@ def _get_config(ctx):
 
 def _hook(state, session_id=None, user_message=None, conversation_history=None,
           is_first_turn=False, model=None, platform=None, **kwargs):
-    cfg = state.config
+    try:
+        cfg = state.config
+        mode = _normalize_mode(cfg.get("mode"))
 
-    # Cheap off switches: no I/O at all.
-    if cfg.get("mode") == "off":
-        return None
-    if not cfg.get("mental_model_ids"):
-        return None
-    if cfg.get("mode") == "first_turn" and not is_first_turn:
-        return None
-    if platform in (cfg.get("skip_platforms") or []):
-        return None
+        # Cheap off switches: no I/O at all.
+        if mode == "off":
+            return None
+        if not core._as_list(cfg.get("mental_model_ids")):
+            return None
+        if mode == "first_turn" and not is_first_turn:
+            return None
+        if platform in core._as_list(cfg.get("skip_platforms")):
+            return None
 
-    # Per-session guard: a retried first turn must not double-inject.
-    if is_first_turn and session_id in state.guard:
-        return None
+        # Per-session guard: a retried first turn must not double-inject.
+        if is_first_turn and session_id in state.guard:
+            return None
 
-    text = core.build_injection(cfg, _logger)
-    if not text:
-        return None
+        text = core.build_injection(cfg, _logger)
+        if not text:
+            return None
 
-    if is_first_turn:
-        state.guard.add(session_id)
-    return {"context": text}
+        if is_first_turn:
+            state.guard.add(session_id)
+        return {"context": text}
+    except Exception as exc:  # never raise into the conversation
+        _logger.warning("hindsight-plus: pre_llm_call failed: %s", exc)
+        return None
 
 
 def register(ctx):
     state = _State(_get_config(ctx))
-    ctx.register_hook("pre_llm_call", functools.partial(_hook, state))
+
+    def hook(**kwargs):
+        return _hook(state, **kwargs)
+
+    # A ``**kwargs`` callback opts into additive hook payload fields and keeps
+    # ``hermes plugins doctor`` happy.
+    ctx.register_hook("pre_llm_call", hook)

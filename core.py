@@ -12,6 +12,8 @@ import json
 import logging
 import os
 import pathlib
+import time
+import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 
@@ -26,11 +28,41 @@ HERMES_CALLBACK_CAP = 10_000
 
 
 def _hermes_home() -> pathlib.Path:
+    # Hermes' canonical resolver follows the active profile; fall back to the
+    # environment and finally to this plugin's install path when imported
+    # outside Hermes (tests, ad-hoc use).
+    try:
+        from hermes_constants import get_hermes_home
+
+        return pathlib.Path(get_hermes_home())
+    except Exception:
+        pass
     env = os.environ.get("HERMES_HOME")
     if env:
         return pathlib.Path(env)
     # Plugin lives at $HERMES_HOME/plugins/<id>/core.py -> parents[2] is the home.
     return pathlib.Path(__file__).resolve().parents[2]
+
+
+def _plugin_data_dir(hermes_home=None) -> pathlib.Path:
+    """Return the plugin-owned data directory (``<home>/plugin-data/<id>/``).
+
+    Uses Hermes' ``plugin_data_dir`` when available so the active profile and
+    its collision-resistant namespace are honoured; otherwise falls back to the
+    documented path.
+    """
+    if hermes_home is not None:
+        return pathlib.Path(hermes_home) / "plugin-data" / PLUGIN_ID
+    try:
+        from plugins.plugin_storage import plugin_data_dir as _pdd
+    except Exception:
+        _pdd = None
+    if _pdd is not None:
+        try:
+            return pathlib.Path(_pdd(PLUGIN_ID))
+        except Exception:
+            pass
+    return _hermes_home() / "plugin-data" / PLUGIN_ID
 
 
 def _now_iso() -> str:
@@ -86,9 +118,44 @@ def _human_age(seconds) -> str:
 
 def _safe_name(value: str) -> str:
     value = str(value)
-    for ch in ("/", "\\"):
-        value = value.replace(ch, "_")
-    return value
+    cleaned = "".join(ch if (ch.isalnum() or ch in "._-") else "_" for ch in value)
+    return cleaned or "_"
+
+
+def _as_list(value):
+    """Coerce a config value to a list of non-empty strings."""
+    if value is None:
+        return []
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return []
+        if text.startswith("["):
+            try:
+                parsed = json.loads(text)
+            except ValueError:
+                parsed = None
+            if isinstance(parsed, list):
+                return [str(item).strip() for item in parsed if str(item).strip()]
+        return [part.strip() for part in text.split(",") if part.strip()]
+    if isinstance(value, (list, tuple, set)):
+        return [str(item).strip() for item in value if str(item).strip()]
+    text = str(value).strip()
+    return [text] if text else []
+
+
+def _as_int(value, default):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _as_float(value, default):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
 
 
 def _http_get_json(url, timeout_s, api_key):
@@ -158,6 +225,7 @@ def truncate(text: str, max_chars: int, model_ids) -> str:
     """Truncate ``text`` at the last complete line that fits within ``max_chars``
     and append a marker line. The final string (including the marker) never
     exceeds ``max_chars``."""
+    max_chars = max(1, int(max_chars))
     if len(text) <= max_chars:
         return text
 
@@ -165,10 +233,12 @@ def truncate(text: str, max_chars: int, model_ids) -> str:
     label = "mental model" if len(model_ids) == 1 else "mental models"
     marker = f"[... truncated — full {label}: {ids}]"
 
+    # If the marker cannot fit, honour the hard cap and skip it.
+    if len(marker) + 1 >= max_chars:
+        return text[:max_chars]
+
     # Reserve room for the marker and its preceding newline.
     budget = max_chars - len(marker) - 1
-    if budget < 1:
-        budget = 1
 
     head = text[:budget]
     cut = head.rfind("\n")
@@ -204,28 +274,35 @@ def build_header(models) -> str:
 
 
 class HindsightClient:
+    """Minimal Hindsight client with one shared wall-clock budget.
+
+    ``timeout_s`` bounds the *whole* injection attempt (all models), not each
+    request, so a slow endpoint cannot stretch a turn past the configured
+    budget. Requests still fall back to the on-disk cache on failure.
+    """
+
     def __init__(self, api_url, bank_id, api_key, timeout_s):
         self.api_url = (api_url or "").rstrip("/")
         self.bank_id = bank_id
         self.api_key = api_key
         self.timeout_s = timeout_s
-        self._list = None
+        self._deadline = time.monotonic() + max(0.0, float(timeout_s or 0.0))
 
-    def list_models(self):
-        if self._list is None:
-            url = f"{self.api_url}/banks/{self.bank_id}/mental-models"
-            data = _http_get_json(url, self.timeout_s, self.api_key)
-            items = data.get("items", []) if isinstance(data, dict) else []
-            self._list = {
-                item.get("id"): item
-                for item in items
-                if isinstance(item, dict) and item.get("id")
-            }
-        return self._list
+    def _remaining(self):
+        return max(0.0, self._deadline - time.monotonic())
 
     def get_model(self, model_id):
-        url = f"{self.api_url}/banks/{self.bank_id}/mental-models/{model_id}"
-        return _http_get_json(url, self.timeout_s, self.api_key)
+        remaining = self._remaining()
+        if remaining <= 0:
+            raise TimeoutError("Hindsight request budget exhausted")
+        bank = urllib.parse.quote(str(self.bank_id), safe="")
+        model = urllib.parse.quote(str(model_id), safe="")
+        # ``detail=content`` is required: the API returns metadata only by default.
+        url = (
+            f"{self.api_url}/v1/default/banks/{bank}"
+            f"/mental-models/{model}?detail=content"
+        )
+        return _http_get_json(url, remaining, self.api_key)
 
 
 def load_model(model_id, client, cache_path, ttl, logger):
@@ -234,12 +311,6 @@ def load_model(model_id, client, cache_path, ttl, logger):
         return cached
 
     try:
-        info = {}
-        try:
-            info = client.list_models().get(model_id) or {}
-        except Exception as exc:  # list is best-effort; individual fetch is what matters
-            logger.warning("hindsight-plus: could not list mental models for %s: %s", model_id, exc)
-
         obj = client.get_model(model_id)
         if not isinstance(obj, dict):
             raise ValueError("unexpected response shape for mental model")
@@ -248,18 +319,12 @@ def load_model(model_id, client, cache_path, ttl, logger):
         if not isinstance(content, str):
             content = ""
 
-        name = info.get("name") or obj.get("name") or model_id
-        last_refreshed = info.get("last_refreshed_at") or obj.get("last_refreshed_at")
-        is_stale = info.get("is_stale")
-        if is_stale is None:
-            is_stale = obj.get("is_stale")
-
         record = {
             "content": content,
-            "name": str(name),
+            "name": str(obj.get("name") or model_id),
             "fetched_at": _now_iso(),
-            "last_refreshed_at": last_refreshed,
-            "is_stale": is_stale,
+            "last_refreshed_at": obj.get("last_refreshed_at"),
+            "is_stale": obj.get("is_stale"),
         }
         _write_cache(cache_path, record)
         return record
@@ -287,14 +352,17 @@ def build_injection(config, logger=None, hermes_home=None):
         )
         return None
 
-    cache_dir = home / "plugin-data" / PLUGIN_ID
-    client = HindsightClient(api_url, bank_id, api_key, config.get("timeout_s", 3.0))
+    cache_dir = _plugin_data_dir(hermes_home)
+    timeout_s = _as_float(config.get("timeout_s"), 3.0)
+    cache_ttl_s = _as_int(config.get("cache_ttl_s"), 21600)
+    model_ids = _as_list(config.get("mental_model_ids"))
+    client = HindsightClient(api_url, bank_id, api_key, timeout_s)
 
     models = []
     sections = []
-    for model_id in config.get("mental_model_ids") or []:
+    for model_id in model_ids:
         cache_path = cache_dir / f"{_safe_name(bank_id)}--{_safe_name(model_id)}.json"
-        model = load_model(model_id, client, cache_path, config.get("cache_ttl_s", 21600), logger)
+        model = load_model(model_id, client, cache_path, cache_ttl_s, logger)
         if model is None:
             continue
         content = (model.get("content") or "").strip()
@@ -307,6 +375,6 @@ def build_injection(config, logger=None, hermes_home=None):
         logger.warning("hindsight-plus: no mental model content available; injecting nothing")
         return None
 
-    max_chars = min(int(config.get("max_chars", 6000)), HERMES_CALLBACK_CAP)
+    max_chars = max(1, min(_as_int(config.get("max_chars"), 6000), HERMES_CALLBACK_CAP))
     text = build_header(models) + "\n\n" + "\n\n".join(sections)
-    return truncate(text, max_chars, config.get("mental_model_ids") or [])
+    return truncate(text, max_chars, model_ids)
