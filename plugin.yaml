@@ -1,6 +1,6 @@
 manifest_version: 2
 name: hermes-hindsight-plus
-version: 0.2.1
+version: 0.3.0
 description: >-
   Inject Hindsight mental models into the first turn of every conversation,
   replacing hand-maintained MEMORY.md / USER.md files with stable,
@@ -42,6 +42,13 @@ config_schema:
     type: list
     description: Platforms on which no injection happens.
     default: ["cron"]
+  context_note:
+    type: str
+    description: >-
+      Optional static context injected before the mental model content. Use it for
+      deployment facts (instance, profiles, architecture) that should always be
+      present. Empty by default. Do not put secrets here.
+    default: ""
   create_missing:
     type: bool
     description: >-
@@ -61,9 +68,10 @@ config_schema:
       Build a stable operating context for this assistant from the bank's durable
       memories. Cover the user's identity and preferences, environment and
       infrastructure facts, active projects and commitments, standing
-      instructions, and recurring workflows. Exclude transient details, secrets,
-      and anything likely to change soon. Return concise markdown with short
-      sections.
+      instructions, recurring workflows, and the assistant's deployment topology
+      (instance, profiles, and memory-bank mapping) when known. Exclude transient
+      details, secrets, and anything likely to change soon. Return concise
+      markdown with short sections.
   create_refresh_cron:
     type: str
     description: >-

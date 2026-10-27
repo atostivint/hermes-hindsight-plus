@@ -640,6 +640,30 @@ def test_success_logs_injection_metadata_only(
     assert "remember to be terse" not in log
 
 
+def test_context_note_prepended_before_model(plugin, core, monkeypatch, tmp_path):
+    _setup_env(monkeypatch, tmp_path)
+    monkeypatch.setattr(core, "_http_get_json", _fake_transport([]))
+
+    text = core.build_injection(
+        _make_config(context_note="DEPLOYMENT: profile X on instance Y")
+    )
+    assert text is not None
+    assert text.index("DEPLOYMENT:") < text.index("## Stable operating context")
+    assert "remember to be terse" in text
+
+
+def test_context_note_alone_does_not_inject(plugin, core, monkeypatch, tmp_path):
+    _setup_env(monkeypatch, tmp_path)
+    monkeypatch.setattr(core, "_http_get_json", _fake_transport([], fail=True))
+
+    assert (
+        core.build_injection(
+            _make_config(context_note="DEPLOYMENT: profile X on instance Y")
+        )
+        is None
+    )
+
+
 def test_as_bool(core):
     assert core._as_bool(True, False) is True
     assert core._as_bool("false", True) is False

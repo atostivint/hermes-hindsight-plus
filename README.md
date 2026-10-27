@@ -4,7 +4,7 @@ Inject [Hindsight](https://github.com/vectorize-io/hindsight) **mental models** 
 first turn of every Hermes Agent conversation, so each session starts with stable,
 cron-refreshed context instead of a hand-maintained `MEMORY.md` / `USER.md`.
 
-Version 0.2.1 — MIT.
+Version 0.3.0 — MIT.
 
 ## Why mental models instead of MEMORY.md / USER.md
 
@@ -98,15 +98,45 @@ hermes config set plugins.entries.hermes-hindsight-plus.settings.mode first_turn
 | `cache_ttl_s`          | `21600` | Seconds a cached model stays fresh (no network call). |
 | `timeout_s`            | `3.0` | Total wall-clock budget for the whole injection attempt. |
 | `skip_platforms`       | `["cron"]` | Platforms on which no injection happens. |
+| `context_note`         | `""` | Optional static text injected before the model content. Use it for deployment/architecture facts. Never put secrets here. |
 | `create_missing`       | `true` | Create a configured model when Hindsight returns `404`. Existing models are never modified. |
 | `create_name`          | `Stable operating context` | Name used only when creating a missing model. |
-| `create_source_query`  | built-in prompt | Query Hindsight's reflect agent uses to generate a newly created model's content. |
+| `create_source_query`  | built-in prompt | Query Hindsight's reflect agent uses to generate a newly created model's content; the default asks for the deployment topology when known. |
 | `create_refresh_cron`  | `0 3 * * *` | UTC 5-field cron for newly created models. Empty disables the schedule. |
 | `create_max_tokens`    | `2048` | Maximum generated tokens for a newly created model (256–8192). |
 | `create_mode`          | `full` | `full` or `delta` for newly created models. |
 
 > Hermes parses YAML 1.1, where an unquoted `off` is the boolean `false`. The plugin
 > normalizes both forms, but quoting it (`mode: "off"`) is clearest in `config.yaml`.
+
+## Optimizing for your deployment
+
+The plugin ships **generic** defaults: no hostnames, profile names, or bank names are
+hard-coded. Put deployment-specific facts in settings, per profile:
+
+- `context_note`: static text injected before the mental model content on every first
+  turn. Use it for instance/profile/architecture facts. Empty by default. Never put
+  secrets here — it is sent to the model.
+- `create_source_query`: prompt Hindsight uses when creating a missing model. The default
+  asks for the deployment topology when known; override it to match your own wording.
+- `create_name`, `create_refresh_cron`, `create_max_tokens`, `create_mode`: shape the
+  created model.
+
+Example (`config.yaml`, per profile):
+
+```yaml
+plugins:
+  entries:
+    hermes-hindsight-plus:
+      settings:
+        context_note: |
+          Deployment: this assistant is the `default` profile on the
+          `primary` instance. The host named `secondary` is a separate
+          instance. Profiles: default, work, personal.
+```
+
+The note is injected only when at least one mental model has content; it never triggers a
+Hindsight write.
 
 ## Behaviour notes
 
@@ -174,7 +204,7 @@ Validated against the live Hermes loader (`hermes_cli.plugin_validate`, the same
 as `hermes plugins validate` / the plugin-catalog admission CI):
 
 - manifest v2 parses, `config_schema` shape is valid, and the settings form renders all
-  twelve keys with the right defaults and `mode` / `create_mode` choices;
+  thirteen keys with the right defaults and `mode` / `create_mode` choices;
 - the capability probe imports the plugin, runs `register()` in isolation, and confirms the
   declared `pre_llm_call` hook matches what is actually registered;
 - the security scan is `safe` and the plugin-host isolation verdict is `host` (host-ready).

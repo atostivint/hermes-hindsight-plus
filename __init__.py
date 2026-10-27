@@ -24,6 +24,9 @@ DEFAULTS = {
     "cache_ttl_s": 21600,
     "timeout_s": 3.0,
     "skip_platforms": ["cron"],
+    # Optional static context for this deployment (empty by default). Users can
+    # put instance/profile/architecture facts here without forking the plugin.
+    "context_note": "",
     # Create-if-missing: only a 404 triggers a POST. Existing models are never
     # patched, so users keep full control of their names, queries, and schedules.
     "create_missing": True,

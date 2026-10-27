@@ -26,6 +26,10 @@ never updates an existing model.
   `trigger.refresh_cron = "0 3 * * *"`; creation happens in the `pre_llm_call` hook, never
   in `register()` (Hermes requires registration to be I/O-free). Invalid model ids are
   skipped rather than POSTed.
+- **Keep defaults generic.** No hostnames, profile names, or bank names in code or manifest
+  defaults. Deployment-specific facts belong in per-profile settings: `context_note`
+  (static text injected before the model content) and `create_source_query` (used only
+  when creating a missing model).
 - **Stay under Hermes' 10,000-char per-callback cap.** `max_chars` default 6000 already
   does; `core.build_injection` clamps `max_chars` to that ceiling defensively.
 
@@ -36,13 +40,14 @@ never updates an existing model.
   keep `from . import core` (the directory name has a hyphen, so the module is not
   importable by its on-disk name).
 - `core.py` — endpoint resolution, HTTP transport (GET + create POST), cache read/write,
-  truncation, header, `create_spec`, `_create_missing_model`, `HindsightClient.create_model`,
-  and `build_injection`. Uses `plugins.plugin_storage.plugin_data_dir` when running inside
-  Hermes and falls back to `<HERMES_HOME>/plugin-data/<id>/` otherwise.
+  truncation, header, `context_note`, `create_spec`, `_create_missing_model`,
+  `HindsightClient.create_model`, and `build_injection`. Uses
+  `plugins.plugin_storage.plugin_data_dir` when running inside Hermes and falls back to
+  `<HERMES_HOME>/plugin-data/<id>/` otherwise.
 - `plugin.yaml` — manifest v2: `provides_hooks: [pre_llm_call]` and a `config_schema`
   **mapping** of `key -> {type, description, default, choices?}` (not JSON-Schema
-  `properties`). The `create_*` settings drive create-if-missing. Hermes parses YAML 1.1, so
-  quote `"off"` in `choices`.
+  `properties`). The `context_note` / `create_*` settings carry deployment-specific
+  customization. Hermes parses YAML 1.1, so quote `"off"` in `choices`.
 - `tests/` — pytest suite, including a live HTTP round-trip for `404` → create POST → GET.
   `conftest.py` loads the package under a valid module name.
 

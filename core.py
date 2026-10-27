@@ -35,9 +35,10 @@ DEFAULT_CREATE_SOURCE_QUERY = (
     "Build a stable operating context for this assistant from the bank's durable "
     "memories. Cover the user's identity and preferences, environment and "
     "infrastructure facts, active projects and commitments, standing "
-    "instructions, and recurring workflows. Exclude transient details, secrets, "
-    "and anything likely to change soon. Return concise markdown with short "
-    "sections."
+    "instructions, recurring workflows, and the assistant's deployment topology "
+    "(instance, profiles, and memory-bank mapping) when known. Exclude transient "
+    "details, secrets, and anything likely to change soon. Return concise "
+    "markdown with short sections."
 )
 DEFAULT_CREATE_REFRESH_CRON = "0 3 * * *"  # daily at 03:00 UTC
 DEFAULT_CREATE_MAX_TOKENS = 2048
@@ -543,5 +544,10 @@ def build_injection(config, logger=None, hermes_home=None):
         return None
 
     max_chars = max(1, min(_as_int(config.get("max_chars"), 6000), HERMES_CALLBACK_CAP))
-    text = build_header(models) + "\n\n" + "\n\n".join(sections)
+    note = str(config.get("context_note") or "").strip()
+    parts = [build_header(models)]
+    if note:
+        parts.append(note)
+    parts.extend(sections)
+    text = "\n\n".join(parts)
     return truncate(text, max_chars, model_ids)
