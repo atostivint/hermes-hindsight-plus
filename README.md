@@ -4,7 +4,7 @@ Inject [Hindsight](https://github.com/vectorize-io/hindsight) **mental models** 
 first turn of every Hermes Agent conversation, so each session starts with stable,
 cron-refreshed context instead of a hand-maintained `MEMORY.md` / `USER.md`.
 
-Version 0.2.0 — MIT.
+Version 0.2.1 — MIT.
 
 ## Why mental models instead of MEMORY.md / USER.md
 
@@ -126,6 +126,27 @@ hermes config set plugins.entries.hermes-hindsight-plus.settings.mode first_turn
   it never raises, and the whole attempt (all models) shares one `timeout_s` budget.
 - **No double injection:** a bounded per-session guard ensures a retried first turn does
   not inject the context twice.
+
+## Verifying the injection
+
+The context is appended to the first **user message** at API time; it is not shown in the
+chat UI and it is not written to `MEMORY.md`. Two ways to confirm it ran:
+
+1. In a new conversation, ask the agent to repeat the first line of the stable-context
+   block it received. A working injection starts with
+   `## Contexte stable (Hindsight mental model, refreshed ...)`.
+2. Read the plugin's success log line:
+   ```bash
+   grep 'hindsight-plus: injected' "$HERMES_HOME/logs/agent.log" | tail
+   ```
+   It reports the char count, `first_turn`, platform, and session id — never the content
+   or the API key. A first-turn injection looks like:
+   ```
+   hindsight-plus: injected 5767 chars (first_turn=True, platform=desktop, session=...)
+   ```
+
+The cache file's `fetched_at` / mtime is only a fetch signal, not proof of injection: a
+fresh cache can be used without any network call.
 
 ## Limitations / what this does not do
 

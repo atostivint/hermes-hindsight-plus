@@ -157,6 +157,15 @@ def _hook(state, session_id=None, user_message=None, conversation_history=None,
         if not text:
             return None
 
+        # Metadata only: never log the injected content or the API key.
+        _logger.info(
+            "hindsight-plus: injected %d chars (first_turn=%s, platform=%s, session=%s)",
+            len(text),
+            is_first_turn,
+            platform or "",
+            session_id or "",
+        )
+
         if is_first_turn:
             state.guard.add(session_id)
         return {"context": text}

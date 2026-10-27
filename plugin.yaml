@@ -1,6 +1,6 @@
 manifest_version: 2
 name: hermes-hindsight-plus
-version: 0.2.0
+version: 0.2.1
 description: >-
   Inject Hindsight mental models into the first turn of every conversation,
   replacing hand-maintained MEMORY.md / USER.md files with stable,

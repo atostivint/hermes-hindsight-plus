@@ -616,6 +616,30 @@ def test_create_missing_sends_bearer_and_writes_no_key(plugin, core, monkeypatch
     assert list(cache_dir.glob("*.json")) == []
 
 
+def test_success_logs_injection_metadata_only(
+    plugin, core, monkeypatch, tmp_path, caplog
+):
+    import logging
+
+    _setup_env(monkeypatch, tmp_path)
+    calls = []
+    monkeypatch.setattr(core, "_http_get_json", _fake_transport(calls))
+    caplog.set_level(logging.INFO, logger="hermes_hindsight_plus")
+
+    state = plugin._State(_make_config())
+    result = plugin._hook(
+        state, session_id="s-log", is_first_turn=True, platform="chat"
+    )
+    assert result is not None
+
+    log = caplog.text
+    assert "hindsight-plus: injected" in log
+    assert "first_turn=True" in log
+    assert "session=s-log" in log
+    # The log carries metadata only, never the model content.
+    assert "remember to be terse" not in log
+
+
 def test_as_bool(core):
     assert core._as_bool(True, False) is True
     assert core._as_bool("false", True) is False
