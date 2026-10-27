@@ -4,7 +4,7 @@ Inject [Hindsight](https://github.com/vectorize-io/hindsight) **mental models** 
 first turn of every Hermes Agent conversation, so each session starts with stable,
 cron-refreshed context instead of a hand-maintained `MEMORY.md` / `USER.md`.
 
-Version 0.1.0 — MIT.
+Version 0.2.0 — MIT.
 
 ## Why mental models instead of MEMORY.md / USER.md
 
@@ -21,7 +21,9 @@ with the same stable context.
 It complements the official Hindsight memory provider (`memory.provider: hindsight`):
 - It does **not** touch `memory.*` configuration.
 - It does **not** write `MEMORY.md` or `USER.md`.
-- It does **not** retain anything back into Hindsight (read-only).
+- It does **not** retain anything back into Hindsight.
+- Its only write is **create-if-missing**: if a configured model returns `404`, it creates
+  that model (never updates, patches, or deletes an existing one).
 
 ## How it works
 
@@ -35,22 +37,32 @@ It complements the official Hindsight memory provider (`memory.provider: hindsig
 
 ## Creating / refreshing the mental model in Hindsight
 
-This plugin only *reads* mental models; create them in Hindsight itself.
+The plugin can bootstrap a missing model for you. On the first turn, it `GET`s each
+configured model; if Hindsight returns `404` and `create_missing` is enabled (the
+default), it `POST`s a new model with:
 
-1. Create a mental model that captures your durable context. For example, in Hindsight
-   use `create_mental_model` with a `source_query` that pulls your stable preferences and
-   standing instructions (e.g. a query like *"my stable operating context: durable user
-   preferences, standing instructions, tooling conventions"*). Give it a memorable name,
-   such as **Stable operating context**.
-2. Attach an automatic refresh trigger so the model stays current without manual edits —
-   configure its refresh to run on a cron cadence that matches how often that context
-   actually changes.
-3. Note the model's **id** (the default config uses `operator-context`; set
-   `mental_model_ids` to the id of your model, e.g. the id returned for *Stable operating
-   context*).
+- the configured `id` (the value from `mental_model_ids`),
+- `create_name` (default **Stable operating context**),
+- `create_source_query` (the prompt Hindsight's reflect agent uses to generate content),
+- `create_max_tokens` (default 2048),
+- `trigger.refresh_cron` (default **`0 3 * * *`**, daily at 03:00 UTC),
+- `trigger.mode` (`full` or `delta`).
 
-> The exact Hindsight `create_mental_model` / refresh-trigger CLI or API surface should be
-> confirmed against your Hindsight installation and version.
+Hindsight generates the content asynchronously in the background and returns an operation
+id. The first turn that creates the model injects nothing (there is no content yet); once
+the reflect run finishes, the next first turn reads and injects it.
+
+**Existing models are never modified.** The plugin only issues `POST` on a `404`; it never
+sends `PATCH`, `PUT`, or `DELETE`. If you already created a model, its name, source query,
+schedule, and content stay exactly as you configured them. If you want a different
+schedule for an existing model, change it in Hindsight.
+
+The Hindsight endpoint must accept writes with the configured credentials. If creation is
+forbidden (`401`/`403`) or fails for any reason, the plugin logs a warning and falls back
+to the cache or injects nothing — it never raises.
+
+> Creation happens in the `pre_llm_call` hook (first turn), not during `register()`:
+> Hermes requires plugin registration to be I/O-free.
 
 ## Install
 
@@ -78,14 +90,20 @@ They are also rendered as a form in the Desktop app under **Capabilities → Plu
 hermes config set plugins.entries.hermes-hindsight-plus.settings.mode first_turn
 ```
 
-| Key               | Default            | Description                                                       |
-|-------------------|--------------------|-------------------------------------------------------------------|
-| `mode`            | `first_turn`       | `first_turn`, `every_turn`, or `off`.                             |
-| `mental_model_ids`| `["operator-context"]` | Hindsight mental model ids to inject, concatenated in order.  |
-| `max_chars`       | `6000`             | Truncation budget for the assembled injection (incl. marker).     |
-| `cache_ttl_s`     | `21600`            | Seconds a cached model stays fresh (no network call).             |
-| `timeout_s`       | `3.0`              | Total wall-clock budget for the whole injection attempt.          |
-| `skip_platforms`  | `["cron"]`         | Platforms on which no injection happens.                          |
+| Key                    | Default | Description |
+|------------------------|---------|-------------|
+| `mode`                 | `first_turn` | `first_turn`, `every_turn`, or `off`. |
+| `mental_model_ids`     | `["operator-context"]` | Hindsight mental model ids to inject, concatenated in order. |
+| `max_chars`            | `6000` | Truncation budget for the assembled injection (incl. marker). |
+| `cache_ttl_s`          | `21600` | Seconds a cached model stays fresh (no network call). |
+| `timeout_s`            | `3.0` | Total wall-clock budget for the whole injection attempt. |
+| `skip_platforms`       | `["cron"]` | Platforms on which no injection happens. |
+| `create_missing`       | `true` | Create a configured model when Hindsight returns `404`. Existing models are never modified. |
+| `create_name`          | `Stable operating context` | Name used only when creating a missing model. |
+| `create_source_query`  | built-in prompt | Query Hindsight's reflect agent uses to generate a newly created model's content. |
+| `create_refresh_cron`  | `0 3 * * *` | UTC 5-field cron for newly created models. Empty disables the schedule. |
+| `create_max_tokens`    | `2048` | Maximum generated tokens for a newly created model (256–8192). |
+| `create_mode`          | `full` | `full` or `delta` for newly created models. |
 
 > Hermes parses YAML 1.1, where an unquoted `off` is the boolean `false`. The plugin
 > normalizes both forms, but quoting it (`mode: "off"`) is clearest in `config.yaml`.
@@ -97,6 +115,9 @@ hermes config set plugins.entries.hermes-hindsight-plus.settings.mode first_turn
 - **Truncation:** content is truncated at the last complete line that fits within
   `max_chars`, then a marker line lists the full mental model id(s). The final text never
   exceeds `max_chars` (default 6000, well under Hermes' 10,000-character per-callback cap).
+- **Create-if-missing only:** a `404` triggers one `POST` with the configured `create_*`
+  options. An existing model is never patched. Hindsight generates the content
+  asynchronously, so the creating turn injects nothing; the next first turn reads it.
 - **Caching:** each model is cached at
   `$HERMES_HOME/plugin-data/hermes-hindsight-plus/<bank>--<model_id>.json`. On a network or
   parse error it falls back to the stale cache (age surfaced in the header); with no cache
@@ -112,8 +133,13 @@ hermes config set plugins.entries.hermes-hindsight-plus.settings.mode first_turn
   appended to the user message of the current turn; it is not part of the system prompt.
 - **No streaming update.** The context is fixed at the moment the turn starts; it is not
   refreshed mid-conversation.
-- **No write access to the bank.** This plugin is strictly read-only and never creates,
-  updates, or deletes mental models in Hindsight.
+- **Create-only, never update.** It creates a missing model (on `404`) but never patches,
+  renames, reschedules, or deletes an existing one. Changing an existing model's content or
+  schedule is done in Hindsight.
+- **Async content generation.** A newly created model has no content until Hindsight's
+  reflect run finishes; the creating turn injects nothing.
+- **Write permission required.** If Hindsight forbids writes, creation fails open (warning,
+  no injection) and the model must be created manually.
 - **No custom dashboard.** Settings use the standard plugin settings form rendered from
   `config_schema` (Desktop **Capabilities → Plugins**, or `config.yaml`); there is no
   separate web dashboard.
@@ -127,7 +153,7 @@ Validated against the live Hermes loader (`hermes_cli.plugin_validate`, the same
 as `hermes plugins validate` / the plugin-catalog admission CI):
 
 - manifest v2 parses, `config_schema` shape is valid, and the settings form renders all
-  six keys with the right defaults and `mode` choices;
+  twelve keys with the right defaults and `mode` / `create_mode` choices;
 - the capability probe imports the plugin, runs `register()` in isolation, and confirms the
   declared `pre_llm_call` hook matches what is actually registered;
 - the security scan is `safe` and the plugin-host isolation verdict is `host` (host-ready).

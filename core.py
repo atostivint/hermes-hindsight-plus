@@ -12,7 +12,9 @@ import json
 import logging
 import os
 import pathlib
+import re
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
@@ -25,6 +27,24 @@ PLUGIN_ID = "hermes-hindsight-plus"
 # under it by default; this is a defensive ceiling in case a user configures a
 # very large max_chars.
 HERMES_CALLBACK_CAP = 10_000
+
+# Defaults used only when a configured mental model is absent and the user has
+# enabled create-if-missing. Existing models are never modified.
+DEFAULT_CREATE_NAME = "Stable operating context"
+DEFAULT_CREATE_SOURCE_QUERY = (
+    "Build a stable operating context for this assistant from the bank's durable "
+    "memories. Cover the user's identity and preferences, environment and "
+    "infrastructure facts, active projects and commitments, standing "
+    "instructions, and recurring workflows. Exclude transient details, secrets, "
+    "and anything likely to change soon. Return concise markdown with short "
+    "sections."
+)
+DEFAULT_CREATE_REFRESH_CRON = "0 3 * * *"  # daily at 03:00 UTC
+DEFAULT_CREATE_MAX_TOKENS = 2048
+DEFAULT_CREATE_MODE = "full"
+
+# Hindsight IDs are lowercase alphanumeric with hyphens.
+_MODEL_ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
 
 
 def _hermes_home() -> pathlib.Path:
@@ -158,6 +178,20 @@ def _as_float(value, default):
         return default
 
 
+def _as_bool(value, default):
+    """Coerce a config value to bool, tolerating YAML 1.1 spellings."""
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "on", "enabled"}:
+        return True
+    if text in {"0", "false", "no", "off", "disabled"}:
+        return False
+    return default
+
+
 def _http_get_json(url, timeout_s, api_key):
     req = urllib.request.Request(url, method="GET")
     req.add_header("Accept", "application/json")
@@ -166,6 +200,23 @@ def _http_get_json(url, timeout_s, api_key):
     with urllib.request.urlopen(req, timeout=timeout_s) as resp:
         body = resp.read()
     return json.loads(body.decode("utf-8"))
+
+
+def _http_post_json(url, timeout_s, api_key, payload):
+    data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    req = urllib.request.Request(url, data=data, method="POST")
+    req.add_header("Accept", "application/json")
+    req.add_header("Content-Type", "application/json")
+    if api_key:
+        req.add_header("Authorization", "Bearer " + api_key)
+    with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+        body = resp.read()
+    if not body:
+        return {}
+    try:
+        return json.loads(body.decode("utf-8"))
+    except ValueError:
+        return {}
 
 
 def resolve_endpoint(hermes_home):
@@ -191,6 +242,45 @@ def resolve_endpoint(hermes_home):
         api_key = cfg.get("api_key") or ""
 
     return (api_url or ""), (bank_id or ""), (api_key or "")
+
+
+def create_spec(config):
+    """Return the create-if-missing spec, or ``None`` when creation is disabled.
+
+    Only used after a 404: an existing model is never patched, so its name,
+    source query, schedule, and content stay whatever the user configured.
+    """
+    if not _as_bool(config.get("create_missing"), True):
+        return None
+
+    name = str(config.get("create_name") or DEFAULT_CREATE_NAME).strip()
+    source_query = str(
+        config.get("create_source_query") or DEFAULT_CREATE_SOURCE_QUERY
+    ).strip()
+    raw_cron = config.get("create_refresh_cron")
+    # Absent -> the documented daily default. Explicit "" -> no schedule.
+    cron = (
+        DEFAULT_CREATE_REFRESH_CRON
+        if raw_cron is None
+        else str(raw_cron).strip()
+    )
+    max_tokens = _as_int(config.get("create_max_tokens"), DEFAULT_CREATE_MAX_TOKENS)
+    max_tokens = max(256, min(8192, max_tokens))
+    mode = str(config.get("create_mode") or DEFAULT_CREATE_MODE).strip().lower()
+    if mode not in {"full", "delta"}:
+        mode = DEFAULT_CREATE_MODE
+
+    return {
+        "name": name or DEFAULT_CREATE_NAME,
+        "source_query": source_query or DEFAULT_CREATE_SOURCE_QUERY,
+        "refresh_cron": cron,
+        "max_tokens": max_tokens,
+        "mode": mode,
+    }
+
+
+def _is_valid_model_id(model_id):
+    return bool(_MODEL_ID_RE.match(str(model_id or "")))
 
 
 def _read_cache(path: pathlib.Path):
@@ -304,8 +394,69 @@ class HindsightClient:
         )
         return _http_get_json(url, remaining, self.api_key)
 
+    def create_model(self, model_id, spec):
+        remaining = self._remaining()
+        if remaining <= 0:
+            raise TimeoutError("Hindsight request budget exhausted")
+        bank = urllib.parse.quote(str(self.bank_id), safe="")
+        url = f"{self.api_url}/v1/default/banks/{bank}/mental-models"
+        trigger = {
+            "mode": spec.get("mode") or DEFAULT_CREATE_MODE,
+            # ``refresh_cron`` and ``refresh_after_consolidation`` are mutually
+            # exclusive; the daily cron is the default.
+            "refresh_after_consolidation": False,
+        }
+        cron = spec.get("refresh_cron") or ""
+        if cron:
+            trigger["refresh_cron"] = cron
+        payload = {
+            "id": model_id,
+            "name": spec.get("name") or DEFAULT_CREATE_NAME,
+            "source_query": spec.get("source_query") or DEFAULT_CREATE_SOURCE_QUERY,
+            "max_tokens": spec.get("max_tokens") or DEFAULT_CREATE_MAX_TOKENS,
+            "trigger": trigger,
+        }
+        return _http_post_json(url, remaining, self.api_key, payload)
 
-def load_model(model_id, client, cache_path, ttl, logger):
+
+def _create_missing_model(model_id, client, spec, logger):
+    """Create one absent mental model. Never called for an existing model."""
+    if not _is_valid_model_id(model_id):
+        logger.warning(
+            "hindsight-plus: cannot create mental model %r: id must be lowercase "
+            "alphanumeric with hyphens",
+            model_id,
+        )
+        return False
+    try:
+        client.create_model(model_id, spec)
+        logger.info(
+            "hindsight-plus: created missing mental model %s (refresh_cron=%s)",
+            model_id,
+            spec.get("refresh_cron") or "none",
+        )
+        return True
+    except urllib.error.HTTPError as exc:
+        if exc.code == 409:
+            logger.info(
+                "hindsight-plus: mental model %s already exists (concurrent create)",
+                model_id,
+            )
+            return True
+        logger.warning(
+            "hindsight-plus: failed to create mental model %s: HTTP %s",
+            model_id,
+            exc.code,
+        )
+        return False
+    except Exception as exc:
+        logger.warning(
+            "hindsight-plus: failed to create mental model %s: %s", model_id, exc
+        )
+        return False
+
+
+def load_model(model_id, client, cache_path, ttl, logger, create=None):
     cached = _read_cache(cache_path)
     if cached is not None and _is_fresh(cached, ttl):
         return cached
@@ -329,7 +480,22 @@ def load_model(model_id, client, cache_path, ttl, logger):
         _write_cache(cache_path, record)
         return record
     except Exception as exc:
-        logger.warning("hindsight-plus: failed to fetch mental model %s: %s", model_id, exc)
+        missing = isinstance(exc, urllib.error.HTTPError) and exc.code == 404
+        if missing and create is not None:
+            # Create only when the model is absent. Never PATCH an existing
+            # model: its name, query, schedule, and content belong to the user.
+            created = _create_missing_model(model_id, client, create, logger)
+            if not created:
+                logger.warning(
+                    "hindsight-plus: failed to fetch mental model %s: %s",
+                    model_id,
+                    exc,
+                )
+        else:
+            logger.warning(
+                "hindsight-plus: failed to fetch mental model %s: %s", model_id, exc
+            )
+
         if cached is not None:
             fallback = dict(cached)
             fallback["_stale_cache_age"] = _cache_age_s(cached)
@@ -356,13 +522,14 @@ def build_injection(config, logger=None, hermes_home=None):
     timeout_s = _as_float(config.get("timeout_s"), 3.0)
     cache_ttl_s = _as_int(config.get("cache_ttl_s"), 21600)
     model_ids = _as_list(config.get("mental_model_ids"))
+    create = create_spec(config)
     client = HindsightClient(api_url, bank_id, api_key, timeout_s)
 
     models = []
     sections = []
     for model_id in model_ids:
         cache_path = cache_dir / f"{_safe_name(bank_id)}--{_safe_name(model_id)}.json"
-        model = load_model(model_id, client, cache_path, cache_ttl_s, logger)
+        model = load_model(model_id, client, cache_path, cache_ttl_s, logger, create)
         if model is None:
             continue
         content = (model.get("content") or "").strip()

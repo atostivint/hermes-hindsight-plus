@@ -24,6 +24,14 @@ DEFAULTS = {
     "cache_ttl_s": 21600,
     "timeout_s": 3.0,
     "skip_platforms": ["cron"],
+    # Create-if-missing: only a 404 triggers a POST. Existing models are never
+    # patched, so users keep full control of their names, queries, and schedules.
+    "create_missing": True,
+    "create_name": core.DEFAULT_CREATE_NAME,
+    "create_source_query": core.DEFAULT_CREATE_SOURCE_QUERY,
+    "create_refresh_cron": core.DEFAULT_CREATE_REFRESH_CRON,
+    "create_max_tokens": core.DEFAULT_CREATE_MAX_TOKENS,
+    "create_mode": core.DEFAULT_CREATE_MODE,
 }
 
 _logger = logging.getLogger("hermes_hindsight_plus")
