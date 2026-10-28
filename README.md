@@ -1,9 +1,9 @@
 # hermes-hindsight-plus
 
-> **Heads up: this is a personal experiment.** It works for me and it's here in case it's
-> useful to you — but I've since moved to a different memory setup and no longer maintain
-> it. No support, no roadmap, no guarantees. It is **not listed in the Hermes plugin
-> catalog**. Copy whatever's helpful, fork it, or take just the parts you need.
+> **Heads up: this is still a work in progress.** I use it with Hindsight day to day, but
+> it isn't release-ready and it is **not listed in the Hermes plugin catalog**. Expect
+> rough edges, no support, and no guarantees. Copy whatever's helpful, fork it, or take
+> just the parts you need.
 
 Inject [Hindsight](https://github.com/vectorize-io/hindsight) **mental models** into the
 first turn of every Hermes Agent conversation, so each session starts with stable,
@@ -202,15 +202,15 @@ fresh cache can be used without any network call.
 - **Reads a pre-existing Hindsight setup.** It assumes the official Hindsight plugin (or an
   equivalent `config.json`) already exposes `api_url` / `bank_id`; it does not bootstrap
   Hindsight itself.
-- **Unmaintained.** Behaviour is pinned to the Hermes and Hindsight APIs as they were when
-  this was written. Later changes to either may break it.
+- **Work in progress.** Behaviour is pinned to the Hermes and Hindsight APIs as they were
+  when this was written. Later changes to either may break it.
 
 ## Compatibility
 
 At the time of writing, this was validated against the live Hermes loader
 (`hermes_cli.plugin_validate`, the same code path as `hermes plugins validate`). It has
-**not** been submitted to the plugin catalog, and it is not kept in sync with newer
-Hermes or Hindsight releases:
+**not** been submitted to the plugin catalog — it isn't release-ready yet — and it is not
+kept in sync with newer Hermes or Hindsight releases:
 
 - manifest v2 parses, `config_schema` shape is valid, and the settings form renders all
   thirteen keys with the right defaults and `mode` / `create_mode` choices;
