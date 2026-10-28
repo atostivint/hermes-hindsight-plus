@@ -81,6 +81,8 @@ python -m pytest -q
 
 ## Repo rules
 
-- Work only inside this repo. The private remote is
-  `origin` = `https://github.com/atostivint/hermes-hindsight-plus` (never public).
+- Work only inside this repo. The remote is
+  `origin` = `https://github.com/atostivint/hermes-hindsight-plus`. The repo is public and
+  published for reference, but it is **not** submitted to the Hermes plugin catalog and is
+  not actively maintained.
 - Commit to `main` with a clear message.

@@ -269,7 +269,7 @@ def test_stale_cache_fallback_on_http_error(plugin, core, monkeypatch, tmp_path)
     text = core.build_injection(_make_config())
     assert text is not None
     assert "old but usable" in text
-    assert "repli cache" in text  # stale-cache age surfaced in the header
+    assert "cache fallback" in text  # stale-cache age surfaced in the header
 
 
 def test_fail_open_when_no_cache_and_network_dead(plugin, core, monkeypatch, tmp_path):
@@ -570,7 +570,7 @@ def test_create_403_keeps_stale_cache(plugin, core, monkeypatch, tmp_path):
     text = core.build_injection(_make_config())
     assert text is not None
     assert "old but usable" in text
-    assert "repli cache" in text
+    assert "cache fallback" in text
 
 
 def test_create_409_is_treated_as_exists(plugin, core, monkeypatch, tmp_path):

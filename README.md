@@ -1,10 +1,15 @@
 # hermes-hindsight-plus
 
+> **Heads up: this is a personal experiment.** It works for me and it's here in case it's
+> useful to you — but I've since moved to a different memory setup and no longer maintain
+> it. No support, no roadmap, no guarantees. It is **not listed in the Hermes plugin
+> catalog**. Copy whatever's helpful, fork it, or take just the parts you need.
+
 Inject [Hindsight](https://github.com/vectorize-io/hindsight) **mental models** into the
 first turn of every Hermes Agent conversation, so each session starts with stable,
 cron-refreshed context instead of a hand-maintained `MEMORY.md` / `USER.md`.
 
-Version 0.3.0 — MIT.
+Version 0.4.0 — MIT.
 
 ## Why mental models instead of MEMORY.md / USER.md
 
@@ -164,7 +169,7 @@ chat UI and it is not written to `MEMORY.md`. Two ways to confirm it ran:
 
 1. In a new conversation, ask the agent to repeat the first line of the stable-context
    block it received. A working injection starts with
-   `## Contexte stable (Hindsight mental model, refreshed ...)`.
+   `## Stable context (Hindsight mental model, refreshed ...)`.
 2. Read the plugin's success log line:
    ```bash
    grep 'hindsight-plus: injected' "$HERMES_HOME/logs/agent.log" | tail
@@ -197,11 +202,15 @@ fresh cache can be used without any network call.
 - **Reads a pre-existing Hindsight setup.** It assumes the official Hindsight plugin (or an
   equivalent `config.json`) already exposes `api_url` / `bank_id`; it does not bootstrap
   Hindsight itself.
+- **Unmaintained.** Behaviour is pinned to the Hermes and Hindsight APIs as they were when
+  this was written. Later changes to either may break it.
 
 ## Compatibility
 
-Validated against the live Hermes loader (`hermes_cli.plugin_validate`, the same code path
-as `hermes plugins validate` / the plugin-catalog admission CI):
+At the time of writing, this was validated against the live Hermes loader
+(`hermes_cli.plugin_validate`, the same code path as `hermes plugins validate`). It has
+**not** been submitted to the plugin catalog, and it is not kept in sync with newer
+Hermes or Hindsight releases:
 
 - manifest v2 parses, `config_schema` shape is valid, and the settings form renders all
   thirteen keys with the right defaults and `mode` / `create_mode` choices;
