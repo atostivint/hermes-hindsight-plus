@@ -53,7 +53,8 @@ never updates an existing model.
 
 ## Live Hermes integration
 
-Reference checkout: `the local Hermes Agent checkout`. Relevant surfaces:
+Reference checkout: a local clone of the Hermes Agent repository (path varies per
+machine). Relevant surfaces:
 
 - `plugins.entries.<id>.settings.<key>` is read through `ctx.get_config`.
 - `pre_llm_call` receives `is_first_turn`, `session_id`, `platform`, `turn_id`, etc.;
