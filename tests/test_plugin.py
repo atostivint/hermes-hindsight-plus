@@ -1142,6 +1142,8 @@ def test_dashboard_api_reads_the_same_audit(
 
             return decorator
 
+        post = get
+
     class FakeHTTPException(Exception):
         def __init__(self, status_code, detail):
             super().__init__(detail)
@@ -1151,6 +1153,7 @@ def test_dashboard_api_reads_the_same_audit(
     fake_fastapi = types.ModuleType("fastapi")
     fake_fastapi.APIRouter = FakeRouter
     fake_fastapi.Query = lambda default=None, **kwargs: default
+    fake_fastapi.Body = lambda default=None, **kwargs: default
     fake_fastapi.HTTPException = FakeHTTPException
     monkeypatch.setitem(sys.modules, "fastapi", fake_fastapi)
     sys.modules.pop("hermes_hindsight_plus_dashboard_core", None)
