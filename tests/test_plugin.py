@@ -60,6 +60,26 @@ def _setup_env(monkeypatch, tmp_path):
     return tmp_path / "plugin-data" / "hermes-hindsight-plus"
 
 
+def _audit_details(text="## Stable operating context\n\nremember to be terse"):
+    return {
+        "text": text,
+        "assembled_chars": len(text) + 20,
+        "max_chars": 6000,
+        "truncated": False,
+        "context_note_chars": 0,
+        "models": [
+            {
+                "id": "operator-context",
+                "name": "Stable operating context",
+                "last_refreshed_at": _iso(NOW),
+                "is_stale": False,
+                "cache_age_s": None,
+                "content_chars": len(text),
+            }
+        ],
+    }
+
+
 def test_first_turn_inject_once_not_turn_two(plugin, core, monkeypatch, tmp_path):
     _setup_env(monkeypatch, tmp_path)
     calls = []
@@ -748,3 +768,414 @@ def test_live_create_then_fetch(plugin, core, monkeypatch, tmp_path):
         server.shutdown()
         server.server_close()
         thread.join(timeout=5)
+
+
+def test_build_injection_details_exposes_text_and_metadata(
+    plugin, core, monkeypatch, tmp_path
+):
+    _setup_env(monkeypatch, tmp_path)
+    calls = []
+    monkeypatch.setattr(core, "_http_get_json", _fake_transport(calls))
+
+    config = _make_config(context_note="DEPLOYMENT: test profile")
+    details = core.build_injection_details(config)
+    text = core.build_injection(config)
+
+    assert details is not None
+    assert details["text"] == text
+    assert "## Stable operating context" in text
+    assert text.startswith("## Stable context")
+    assert "DEPLOYMENT: test profile" in text
+    assert details["context_note_chars"] == len("DEPLOYMENT: test profile")
+    assert details["assembled_chars"] == len(details["text"])
+    assert details["truncated"] is False
+    assert details["max_chars"] == 6000
+    assert details["models"] == [
+        {
+            "id": "operator-context",
+            "name": "Stable operating context",
+            "last_refreshed_at": _iso(NOW),
+            "is_stale": False,
+            "cache_age_s": None,
+            "content_chars": len("remember to be terse"),
+        }
+    ]
+    # Model metadata never carries the raw model content.
+    assert "content" not in details["models"][0]
+
+
+def test_build_injection_details_reports_truncation(
+    plugin, core, monkeypatch, tmp_path
+):
+    _setup_env(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        core, "_http_get_json", _fake_transport([], content="x" * 2000)
+    )
+
+    details = core.build_injection_details(_make_config(max_chars=300))
+    assert details is not None
+    assert details["truncated"] is True
+    assert details["max_chars"] == 300
+    assert len(details["text"]) <= 300
+    assert details["models"][0]["content_chars"] == 2000
+
+
+def test_record_injection_persists_content_and_never_the_api_key(
+    plugin, core, monkeypatch, tmp_path
+):
+    data_dir = _setup_env(monkeypatch, tmp_path)
+    monkeypatch.setenv("HINDSIGHT_API_KEY", "sk-AUDIT-SECRET")
+
+    summary = core.record_injection(
+        _audit_details(),
+        _make_config(),
+        session_id="live-1",
+        task_id="task-1",
+        turn_id="turn-1",
+        user_message="please remember this question",
+        is_first_turn=True,
+        platform="chat",
+        model="gpt-test",
+    )
+
+    assert summary is not None
+    assert summary["session_key"] == "task-1"
+    assert summary["entry_count"] == 1
+
+    audit_path = data_dir / "injection-audit.json"
+    raw = audit_path.read_text("utf-8")
+    assert "sk-AUDIT-SECRET" not in raw
+    assert "remember to be terse" in raw
+    assert "please remember this question" in raw
+
+    history = core.read_injection_history("live-1")
+    assert history["session"]["entry_count"] == 1
+    entry = history["entries"][0]
+    assert entry["turn_id"] == "turn-1"
+    assert entry["task_id"] == "task-1"
+    assert entry["content"] == _audit_details()["text"]
+    assert entry["content_recorded"] is True
+    assert entry["user_preview"] == "please remember this question"
+    assert entry["models"][0]["name"] == "Stable operating context"
+
+    stats = core.injection_audit_stats()
+    assert stats == {
+        "schema": core.AUDIT_SCHEMA,
+        "session_count": 1,
+        "entry_count": 1,
+        "file_present": True,
+    }
+
+
+def test_audit_matches_rotated_session_id_by_task_alias(
+    plugin, core, monkeypatch, tmp_path
+):
+    _setup_env(monkeypatch, tmp_path)
+
+    core.record_injection(
+        _audit_details("first injection"),
+        _make_config(),
+        session_id="live-before-compression",
+        task_id="durable-task",
+        is_first_turn=True,
+    )
+    core.record_injection(
+        _audit_details("second injection"),
+        _make_config(),
+        session_id="live-after-compression",
+        task_id="durable-task",
+        is_first_turn=False,
+    )
+
+    by_new_live_id = core.read_injection_history("live-after-compression")
+    assert by_new_live_id["session"]["entry_count"] == 2
+    assert [entry["content"] for entry in by_new_live_id["entries"]] == [
+        "second injection",
+        "first injection",
+    ]
+
+    by_old_live_id = core.read_injection_history("live-before-compression")
+    assert by_old_live_id["session"]["entry_count"] == 2
+
+    by_task_id = core.read_injection_history("durable-task")
+    assert by_task_id["session"]["entry_count"] == 2
+    assert "live-before-compression" in by_task_id["session"]["aliases"]
+    assert "live-after-compression" in by_task_id["session"]["aliases"]
+
+
+def test_record_content_off_keeps_metadata_only(
+    plugin, core, monkeypatch, tmp_path
+):
+    data_dir = _setup_env(monkeypatch, tmp_path)
+    config = _make_config(record_content=False)
+
+    summary = core.record_injection(
+        _audit_details("very private injected text"),
+        config,
+        session_id="s-private",
+        task_id="task-private",
+        user_message="very private user question",
+        is_first_turn=True,
+    )
+    assert summary is not None
+
+    raw = (data_dir / "injection-audit.json").read_text("utf-8")
+    assert "very private injected text" not in raw
+    assert "very private user question" not in raw
+
+    entry = core.read_injection_history("task-private")["entries"][0]
+    assert entry["content"] is None
+    assert entry["content_recorded"] is False
+    assert entry["user_preview"] == ""
+    assert entry["injected_chars"] == len("very private injected text")
+    assert entry["models"][0]["name"] == "Stable operating context"
+
+
+def test_audit_retention_per_session_and_total(
+    plugin, core, monkeypatch, tmp_path
+):
+    _setup_env(monkeypatch, tmp_path)
+
+    per_session = _make_config(audit_max_entries=10, audit_max_per_session=2)
+    for index in range(3):
+        core.record_injection(
+            _audit_details(f"session-one-{index}"),
+            per_session,
+            session_id="s-one",
+            task_id="t-one",
+        )
+    one = core.read_injection_history("t-one")
+    assert [entry["content"] for entry in one["entries"]] == [
+        "session-one-2",
+        "session-one-1",
+    ]
+
+    total = _make_config(
+        audit_max_entries=2, audit_max_per_session=10, audit_max_sessions=10
+    )
+    core.record_injection(
+        _audit_details("two-a"), total, session_id="s-two", task_id="t-two"
+    )
+    core.record_injection(
+        _audit_details("two-b"), total, session_id="s-two", task_id="t-two"
+    )
+    core.record_injection(
+        _audit_details("three-a"), total, session_id="s-three", task_id="t-three"
+    )
+
+    stats = core.injection_audit_stats()
+    assert stats["entry_count"] == 2
+    sessions = core.list_injection_sessions()["sessions"]
+    assert [session["session_id"] for session in sessions] == ["s-three", "s-two"]
+    assert core.read_injection_history("t-two")["session"]["entry_count"] == 1
+    assert core.read_injection_history("t-three")["session"]["entry_count"] == 1
+
+
+def test_audit_retention_session_cap(
+    plugin, core, monkeypatch, tmp_path
+):
+    _setup_env(monkeypatch, tmp_path)
+    config = _make_config(
+        audit_max_entries=10, audit_max_per_session=10, audit_max_sessions=2
+    )
+    for session_id in ("s-old", "s-mid", "s-new"):
+        core.record_injection(
+            _audit_details(session_id),
+            config,
+            session_id=session_id,
+            task_id=f"task-{session_id}",
+        )
+
+    sessions = core.list_injection_sessions()["sessions"]
+    assert [session["session_id"] for session in sessions] == ["s-new", "s-mid"]
+    assert core.read_injection_history("s-old")["entries"] == []
+
+
+def test_malformed_audit_fails_open_and_is_repaired(
+    plugin, core, monkeypatch, tmp_path
+):
+    data_dir = _setup_env(monkeypatch, tmp_path)
+    data_dir.mkdir(parents=True)
+    audit_path = data_dir / "injection-audit.json"
+    audit_path.write_text('{"sessions": "not-a-map"}', "utf-8")
+
+    assert core.read_injection_history("missing")["entries"] == []
+    assert core.injection_audit_stats()["session_count"] == 0
+
+    summary = core.record_injection(
+        _audit_details(),
+        _make_config(),
+        session_id="s-repaired",
+        task_id="task-repaired",
+    )
+    assert summary is not None
+    assert core.injection_audit_stats()["entry_count"] == 1
+    assert json.loads(audit_path.read_text("utf-8"))["schema"] == core.AUDIT_SCHEMA
+
+
+def test_hook_records_audit_and_broadcasts_metadata_only(
+    plugin, core, monkeypatch, tmp_path
+):
+    _setup_env(monkeypatch, tmp_path)
+    monkeypatch.setattr(core, "_http_get_json", _fake_transport([]))
+    broadcasts = []
+    monkeypatch.setattr(
+        plugin,
+        "_broadcast_injection_recorded",
+        lambda summary: broadcasts.append(summary),
+    )
+
+    state = plugin._State(_make_config())
+    result = plugin._hook(
+        state,
+        session_id="live-hook",
+        task_id="task-hook",
+        turn_id="turn-hook",
+        user_message="hook user question",
+        is_first_turn=True,
+        platform="chat",
+        model="gpt-hook",
+    )
+
+    assert result is not None
+    assert "remember to be terse" in result["context"]
+    assert broadcasts and "content" not in broadcasts[0]
+    assert "context" not in broadcasts[0]
+
+    entry = core.read_injection_history("task-hook")["entries"][0]
+    assert entry["session_id"] == "live-hook"
+    assert entry["task_id"] == "task-hook"
+    assert entry["turn_id"] == "turn-hook"
+    assert entry["user_preview"] == "hook user question"
+    assert entry["content"] == result["context"]
+
+
+def test_hook_survives_audit_failure(plugin, core, monkeypatch, tmp_path):
+    _setup_env(monkeypatch, tmp_path)
+    monkeypatch.setattr(core, "_http_get_json", _fake_transport([]))
+
+    def broken_audit(*args, **kwargs):
+        raise RuntimeError("audit disk is on fire")
+
+    monkeypatch.setattr(core, "record_injection", broken_audit)
+
+    state = plugin._State(_make_config())
+    result = plugin._hook(
+        state, session_id="s-audit-fail", is_first_turn=True, platform="chat"
+    )
+    assert result is not None
+    assert "remember to be terse" in result["context"]
+
+
+def test_broadcast_injection_event_payload_is_content_free(plugin, monkeypatch):
+    import sys
+    import types
+
+    calls = []
+    events = types.ModuleType("hermes_cli.plugin_events")
+    events.broadcast_plugin_event = (
+        lambda plugin_id, event_name, payload: calls.append(
+            (plugin_id, event_name, payload)
+        )
+    )
+    package = types.ModuleType("hermes_cli")
+    package.__path__ = []
+    package.plugin_events = events
+    monkeypatch.setitem(sys.modules, "hermes_cli", package)
+    monkeypatch.setitem(sys.modules, "hermes_cli.plugin_events", events)
+
+    plugin._broadcast_injection_recorded(
+        {
+            "entry_id": "entry-1",
+            "session_id": "live-1",
+            "task_id": "task-1",
+            "session_key": "task-1",
+            "recorded_at": _iso(NOW),
+            "entry_count": 1,
+            "content": "must not travel on the event bus",
+        }
+    )
+
+    assert len(calls) == 1
+    plugin_id, event_name, payload = calls[0]
+    assert plugin_id == "hermes-hindsight-plus"
+    assert event_name == "injection.recorded"
+    assert payload == {
+        "entry_id": "entry-1",
+        "session_id": "live-1",
+        "task_id": "task-1",
+        "session_key": "task-1",
+        "recorded_at": _iso(NOW),
+        "entry_count": 1,
+    }
+
+
+def test_dashboard_api_reads_the_same_audit(
+    plugin, core, monkeypatch, tmp_path
+):
+    import importlib.util
+    import pathlib
+    import sys
+    import types
+
+    _setup_env(monkeypatch, tmp_path)
+    assert (
+        core.record_injection(
+            _audit_details(),
+            _make_config(),
+            session_id="dash-live",
+            task_id="dash-task",
+            user_message="dashboard question",
+            is_first_turn=True,
+        )
+        is not None
+    )
+
+    class FakeRouter:
+        def __init__(self):
+            self.routes = {}
+
+        def get(self, path):
+            def decorator(fn):
+                self.routes[path] = fn
+                return fn
+
+            return decorator
+
+    class FakeHTTPException(Exception):
+        def __init__(self, status_code, detail):
+            super().__init__(detail)
+            self.status_code = status_code
+            self.detail = detail
+
+    fake_fastapi = types.ModuleType("fastapi")
+    fake_fastapi.APIRouter = FakeRouter
+    fake_fastapi.Query = lambda default=None, **kwargs: default
+    fake_fastapi.HTTPException = FakeHTTPException
+    monkeypatch.setitem(sys.modules, "fastapi", fake_fastapi)
+    sys.modules.pop("hermes_hindsight_plus_dashboard_core", None)
+
+    api_path = (
+        pathlib.Path(__file__).resolve().parents[1]
+        / "dashboard"
+        / "plugin_api.py"
+    )
+    spec = importlib.util.spec_from_file_location(
+        "hermes_hindsight_plus_dashboard_api_test", api_path
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    try:
+        assert module.router.routes["/health"] is module.health
+        assert module.health()["entry_count"] == 1
+
+        history = module.history(session_id="dash-task", limit=200)
+        assert history["session"]["entry_count"] == 1
+        assert history["entries"][0]["content"] == _audit_details()["text"]
+        assert history["entries"][0]["user_preview"] == "dashboard question"
+
+        sessions = module.sessions(limit=10)
+        assert sessions["sessions"][0]["key"] == "dash-task"
+    finally:
+        sys.modules.pop("hermes_hindsight_plus_dashboard_core", None)

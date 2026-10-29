@@ -13,6 +13,7 @@ import logging
 import os
 import pathlib
 import re
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -43,6 +44,19 @@ DEFAULT_CREATE_SOURCE_QUERY = (
 DEFAULT_CREATE_REFRESH_CRON = "0 3 * * *"  # daily at 03:00 UTC
 DEFAULT_CREATE_MAX_TOKENS = 2048
 DEFAULT_CREATE_MODE = "full"
+
+# Local injection audit used by the Desktop memory pane. The file is plain
+# JSON under the plugin data directory; it never contains the API key. Keep
+# the bounds conservative so an every-turn deployment cannot grow without
+# limit.
+AUDIT_FILENAME = "injection-audit.json"
+AUDIT_SCHEMA = 1
+AUDIT_CONTENT_CAP = HERMES_CALLBACK_CAP
+AUDIT_PREVIEW_CHARS = 180
+DEFAULT_AUDIT_MAX_TOTAL = 200
+DEFAULT_AUDIT_MAX_PER_SESSION = 20
+DEFAULT_AUDIT_MAX_SESSIONS = 50
+_AUDIT_LOCK = threading.RLock()
 
 # Hindsight IDs are lowercase alphanumeric with hyphens.
 _MODEL_ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
@@ -191,6 +205,18 @@ def _as_bool(value, default):
     if text in {"0", "false", "no", "off", "disabled"}:
         return False
     return default
+
+
+def _json_scalar(value):
+    """Return a JSON-friendly scalar for audit metadata."""
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    return str(value)
+
+
+def _clean_id(value) -> str:
+    text = str(value or "").strip()
+    return text[:256]
 
 
 def _http_get_json(url, timeout_s, api_key):
@@ -504,8 +530,13 @@ def load_model(model_id, client, cache_path, ttl, logger, create=None):
         return None
 
 
-def build_injection(config, logger=None, hermes_home=None):
-    """Assemble the injection text for the given config, or return None to skip."""
+def build_injection_details(config, logger=None, hermes_home=None):
+    """Assemble the injection and return its text plus audit metadata.
+
+    Returns ``None`` when there is nothing to inject. The text is exactly what
+    ``pre_llm_call`` returns; the extra fields let the audit record describe
+    what was injected without re-fetching or re-assembling anything.
+    """
     logger = logger or _LOG
     home = pathlib.Path(hermes_home) if hermes_home else _hermes_home()
 
@@ -527,6 +558,7 @@ def build_injection(config, logger=None, hermes_home=None):
     client = HindsightClient(api_url, bank_id, api_key, timeout_s)
 
     models = []
+    model_meta = []
     sections = []
     for model_id in model_ids:
         cache_path = cache_dir / f"{_safe_name(bank_id)}--{_safe_name(model_id)}.json"
@@ -537,6 +569,17 @@ def build_injection(config, logger=None, hermes_home=None):
         if not content:
             continue
         models.append(model)
+        stale_age = model.get("_stale_cache_age")
+        model_meta.append(
+            {
+                "id": model_id,
+                "name": str(model.get("name") or model_id),
+                "last_refreshed_at": _json_scalar(model.get("last_refreshed_at")),
+                "is_stale": bool(model.get("is_stale")),
+                "cache_age_s": _as_int(stale_age, 0) if stale_age is not None else None,
+                "content_chars": len(content),
+            }
+        )
         sections.append(f"## {model.get('name') or model_id}\n\n{content}")
 
     if not sections:
@@ -550,4 +593,413 @@ def build_injection(config, logger=None, hermes_home=None):
         parts.append(note)
     parts.extend(sections)
     text = "\n\n".join(parts)
-    return truncate(text, max_chars, model_ids)
+    injected = truncate(text, max_chars, model_ids)
+    return {
+        "text": injected,
+        "assembled_chars": len(text),
+        "max_chars": max_chars,
+        "truncated": len(injected) < len(text),
+        "context_note_chars": len(note),
+        "models": model_meta,
+    }
+
+
+def build_injection(config, logger=None, hermes_home=None):
+    """Assemble the injection text for the given config, or return None to skip."""
+    details = build_injection_details(config, logger=logger, hermes_home=hermes_home)
+    if details is None:
+        return None
+    return details.get("text") or None
+
+
+# ---------------------------------------------------------------------------
+# Injection audit
+#
+# The Desktop memory pane reads this file through the plugin's dashboard API.
+# It is deliberately bounded, plain JSON, and content-optional. Never put the
+# API key (or any request header) in here.
+# ---------------------------------------------------------------------------
+
+def _audit_path(hermes_home=None) -> pathlib.Path:
+    return _plugin_data_dir(hermes_home) / AUDIT_FILENAME
+
+
+def _empty_audit() -> dict:
+    return {"schema": AUDIT_SCHEMA, "updated_at": _now_iso(), "sessions": {}}
+
+
+def _sanitize_audit(data) -> dict:
+    """Return a bounded, typed view of an on-disk audit document."""
+    if not isinstance(data, dict):
+        data = {}
+    raw_sessions = data.get("sessions")
+    if not isinstance(raw_sessions, dict):
+        raw_sessions = {}
+
+    sessions = {}
+    for key, bucket in raw_sessions.items():
+        if not isinstance(key, str) or not key or not isinstance(bucket, dict):
+            continue
+        entries = []
+        raw_entries = bucket.get("entries")
+        if isinstance(raw_entries, list):
+            for entry in raw_entries:
+                if isinstance(entry, dict) and isinstance(entry.get("recorded_at"), str):
+                    entries.append(entry)
+        aliases = []
+        for alias in bucket.get("aliases") or []:
+            alias = _clean_id(alias)
+            if alias and alias not in aliases:
+                aliases.append(alias)
+        if key not in aliases:
+            aliases.insert(0, key)
+        sessions[key] = {
+            "session_id": _clean_id(bucket.get("session_id")),
+            "task_id": _clean_id(bucket.get("task_id")),
+            "aliases": aliases[:8],
+            "entries": entries,
+        }
+
+    return {
+        "schema": AUDIT_SCHEMA,
+        "updated_at": _json_scalar(data.get("updated_at")) or _now_iso(),
+        "sessions": sessions,
+    }
+
+
+def _read_audit(path: pathlib.Path) -> dict:
+    try:
+        raw = path.read_text("utf-8")
+    except FileNotFoundError:
+        return _empty_audit()
+    except OSError as exc:
+        _LOG.warning("hindsight-plus: could not read injection audit %s: %s", path, exc)
+        return _empty_audit()
+
+    try:
+        data = json.loads(raw)
+    except ValueError as exc:
+        _LOG.warning("hindsight-plus: ignoring malformed injection audit %s: %s", path, exc)
+        return _empty_audit()
+    return _sanitize_audit(data)
+
+
+def _write_audit(path: pathlib.Path, data: dict) -> bool:
+    tmp = None
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(
+            f"{path.name}.tmp-{os.getpid()}-{threading.get_ident()}"
+        )
+        tmp.write_text(
+            json.dumps(data, ensure_ascii=False, separators=(",", ":")),
+            "utf-8",
+        )
+        os.replace(tmp, path)
+        return True
+    except (OSError, ValueError) as exc:
+        _LOG.warning("hindsight-plus: could not write injection audit %s: %s", path, exc)
+        if tmp is not None:
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
+        return False
+
+
+def _audit_limits(config) -> tuple[int, int, int]:
+    config = config if isinstance(config, dict) else {}
+    max_total = max(
+        1,
+        min(2000, _as_int(config.get("audit_max_entries"), DEFAULT_AUDIT_MAX_TOTAL)),
+    )
+    max_per_session = max(
+        1,
+        min(
+            max_total,
+            _as_int(
+                config.get("audit_max_per_session"), DEFAULT_AUDIT_MAX_PER_SESSION
+            ),
+        ),
+    )
+    max_sessions = max(
+        1,
+        min(500, _as_int(config.get("audit_max_sessions"), DEFAULT_AUDIT_MAX_SESSIONS)),
+    )
+    return max_total, max_per_session, max_sessions
+
+
+def _find_session_key(sessions: dict, session_id="", task_id="") -> str:
+    wanted = [_clean_id(task_id), _clean_id(session_id)]
+    for value in wanted:
+        if not value:
+            continue
+        for key, bucket in sessions.items():
+            candidates = {
+                key,
+                _clean_id(bucket.get("session_id")),
+                _clean_id(bucket.get("task_id")),
+                *[_clean_id(alias) for alias in bucket.get("aliases") or []],
+            }
+            if value in candidates:
+                return key
+    return ""
+
+
+def _audit_model_metadata(models) -> list[dict]:
+    result = []
+    if not isinstance(models, list):
+        return result
+    for item in models[:16]:
+        if not isinstance(item, dict):
+            continue
+        cache_age = item.get("cache_age_s")
+        result.append(
+            {
+                "id": _clean_id(item.get("id")),
+                "name": str(item.get("name") or item.get("id") or "")[:300],
+                "last_refreshed_at": _json_scalar(item.get("last_refreshed_at")),
+                "is_stale": bool(item.get("is_stale")),
+                "cache_age_s": None if cache_age is None else max(0, _as_int(cache_age, 0)),
+                "content_chars": max(0, _as_int(item.get("content_chars"), 0)),
+            }
+        )
+    return result
+
+
+def _user_preview(value) -> str:
+    if isinstance(value, str):
+        text = value
+    elif isinstance(value, list):
+        parts = []
+        for item in value:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict) and isinstance(item.get("text"), str):
+                parts.append(item["text"])
+        text = " ".join(parts)
+    else:
+        text = "" if value is None else str(value)
+    return re.sub(r"\s+", " ", text).strip()[:AUDIT_PREVIEW_CHARS]
+
+
+def _session_summary(key: str, bucket: dict) -> dict:
+    entries = bucket.get("entries") or []
+    latest = entries[-1] if entries else {}
+    models = latest.get("models") if isinstance(latest.get("models"), list) else []
+    return {
+        "key": key,
+        "session_id": _clean_id(bucket.get("session_id")),
+        "task_id": _clean_id(bucket.get("task_id")),
+        "aliases": list(bucket.get("aliases") or [])[:8],
+        "first_recorded_at": entries[0].get("recorded_at") if entries else "",
+        "last_recorded_at": (
+            latest.get("recorded_at") or bucket.get("last_recorded_at") or ""
+        ),
+        "entry_count": len(entries),
+        "last_user_preview": str(latest.get("user_preview") or "")[:AUDIT_PREVIEW_CHARS],
+        "last_injected_chars": max(0, _as_int(latest.get("injected_chars"), 0)),
+        "last_truncated": bool(latest.get("truncated")),
+        "last_models": [
+            str(item.get("name") or item.get("id") or "")
+            for item in models[:8]
+            if isinstance(item, dict)
+        ],
+    }
+
+
+def _trim_audit(
+    sessions: dict, max_total: int, max_per_session: int, max_sessions: int
+) -> None:
+    for bucket in sessions.values():
+        entries = bucket.get("entries") or []
+        if len(entries) > max_per_session:
+            bucket["entries"] = entries[-max_per_session:]
+
+    if len(sessions) > max_sessions:
+        oldest = sorted(
+            sessions.items(),
+            key=lambda item: str(item[1].get("last_recorded_at") or ""),
+        )
+        for key, _bucket in oldest[: len(sessions) - max_sessions]:
+            sessions.pop(key, None)
+
+    total = sum(len(bucket.get("entries") or []) for bucket in sessions.values())
+    while total > max_total:
+        candidates = [
+            (str(bucket.get("last_recorded_at") or ""), key)
+            for key, bucket in sessions.items()
+            if bucket.get("entries")
+        ]
+        if not candidates:
+            break
+        _when, key = min(candidates)
+        bucket = sessions[key]
+        bucket["entries"].pop(0)
+        total -= 1
+        if not bucket["entries"]:
+            sessions.pop(key, None)
+
+    for key, bucket in list(sessions.items()):
+        entries = bucket.get("entries") or []
+        if not entries:
+            sessions.pop(key, None)
+            continue
+        bucket["entry_count"] = len(entries)
+        bucket["first_recorded_at"] = entries[0].get("recorded_at") or ""
+
+
+def record_injection(
+    details,
+    config=None,
+    session_id=None,
+    task_id=None,
+    turn_id=None,
+    user_message=None,
+    is_first_turn=False,
+    platform=None,
+    model=None,
+    hermes_home=None,
+):
+    """Persist one successful injection. Returns a content-free summary.
+
+    Fails open: any read/write error is logged and ``None`` is returned, so it
+    can never break the ``pre_llm_call`` hook that already has context to
+    return.
+    """
+    try:
+        if not isinstance(details, dict):
+            return None
+        text = details.get("text")
+        if not isinstance(text, str) or not text:
+            return None
+        session_id = _clean_id(session_id)
+        task_id = _clean_id(task_id)
+        if not session_id and not task_id:
+            return None
+
+        config = config if isinstance(config, dict) else {}
+        record_content = _as_bool(config.get("record_content"), True)
+        max_total, max_per_session, max_sessions = _audit_limits(config)
+        path = _audit_path(hermes_home)
+
+        with _AUDIT_LOCK:
+            data = _read_audit(path)
+            sessions = data["sessions"]
+            now = _now_iso()
+            key = _find_session_key(sessions, session_id, task_id)
+            if not key:
+                key = task_id or session_id
+            bucket = sessions.get(key)
+            if bucket is None:
+                bucket = {
+                    "session_id": session_id,
+                    "task_id": task_id,
+                    "aliases": [],
+                    "entries": [],
+                }
+                sessions[key] = bucket
+
+            aliases = list(bucket.get("aliases") or [])
+            for value in (key, session_id, task_id):
+                if value and value not in aliases:
+                    aliases.append(value)
+            bucket["aliases"] = aliases[:8]
+            if session_id:
+                bucket["session_id"] = session_id
+            if task_id:
+                bucket["task_id"] = task_id
+
+            entry_id = f"{time.time_ns():x}-{os.urandom(4).hex()}"
+            entry = {
+                "id": entry_id,
+                "recorded_at": now,
+                "session_id": session_id,
+                "task_id": task_id,
+                "turn_id": _clean_id(turn_id),
+                "is_first_turn": bool(is_first_turn),
+                "platform": str(platform or "")[:80],
+                "model": str(model or "")[:160],
+                "user_preview": _user_preview(user_message) if record_content else "",
+                "content": text[:AUDIT_CONTENT_CAP] if record_content else None,
+                "content_recorded": record_content,
+                "injected_chars": len(text),
+                "assembled_chars": max(0, _as_int(details.get("assembled_chars"), len(text))),
+                "max_chars": max(0, _as_int(details.get("max_chars"), 0)),
+                "truncated": bool(details.get("truncated")),
+                "context_note_chars": max(
+                    0, _as_int(details.get("context_note_chars"), 0)
+                ),
+                "models": _audit_model_metadata(details.get("models")),
+            }
+            entries = bucket.setdefault("entries", [])
+            entries.append(entry)
+            bucket["last_recorded_at"] = now
+            _trim_audit(sessions, max_total, max_per_session, max_sessions)
+            data["updated_at"] = now
+            if not _write_audit(path, data):
+                return None
+
+            bucket = sessions.get(key)
+            if bucket is None:
+                return None
+            return {
+                "entry_id": entry_id,
+                "session_key": key,
+                "session_id": bucket.get("session_id") or session_id,
+                "task_id": bucket.get("task_id") or task_id,
+                "recorded_at": now,
+                "entry_count": len(bucket.get("entries") or []),
+            }
+    except Exception as exc:  # audit must never break the injection path
+        _LOG.warning("hindsight-plus: could not record injection audit: %s", exc)
+        return None
+
+
+def read_injection_history(session_id, hermes_home=None, limit=200) -> dict:
+    """Return one session's retained injections, newest first."""
+    session_id = _clean_id(session_id)
+    limit = max(1, min(1000, _as_int(limit, 200)))
+    result = {"schema": AUDIT_SCHEMA, "session": None, "entries": []}
+    if not session_id:
+        return result
+
+    path = _audit_path(hermes_home)
+    with _AUDIT_LOCK:
+        data = _read_audit(path)
+    key = _find_session_key(data["sessions"], session_id=session_id)
+    if not key:
+        return result
+    bucket = data["sessions"][key]
+    result["session"] = _session_summary(key, bucket)
+    result["entries"] = list(reversed(bucket.get("entries") or []))[:limit]
+    return result
+
+
+def list_injection_sessions(hermes_home=None, limit=100) -> dict:
+    """Return retained session summaries, newest first."""
+    limit = max(1, min(500, _as_int(limit, 100)))
+    path = _audit_path(hermes_home)
+    with _AUDIT_LOCK:
+        data = _read_audit(path)
+    sessions = [
+        _session_summary(key, bucket)
+        for key, bucket in data["sessions"].items()
+    ]
+    sessions.sort(key=lambda item: item.get("last_recorded_at") or "", reverse=True)
+    return {"schema": AUDIT_SCHEMA, "sessions": sessions[:limit]}
+
+
+def injection_audit_stats(hermes_home=None) -> dict:
+    path = _audit_path(hermes_home)
+    with _AUDIT_LOCK:
+        data = _read_audit(path)
+    sessions = data["sessions"]
+    return {
+        "schema": AUDIT_SCHEMA,
+        "session_count": len(sessions),
+        "entry_count": sum(len(bucket.get("entries") or []) for bucket in sessions.values()),
+        "file_present": path.is_file(),
+    }
+
+

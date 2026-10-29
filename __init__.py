@@ -27,6 +27,13 @@ DEFAULTS = {
     # Optional static context for this deployment (empty by default). Users can
     # put instance/profile/architecture facts here without forking the plugin.
     "context_note": "",
+    # Local injection audit for the Desktop memory pane. Content is stored in
+    # plain JSON under the plugin data directory; disabling it keeps metadata
+    # only (timestamps, counts, model names) and stores no prompt/injection text.
+    "record_content": True,
+    "audit_max_entries": core.DEFAULT_AUDIT_MAX_TOTAL,
+    "audit_max_per_session": core.DEFAULT_AUDIT_MAX_PER_SESSION,
+    "audit_max_sessions": core.DEFAULT_AUDIT_MAX_SESSIONS,
     # Create-if-missing: only a 404 triggers a POST. Existing models are never
     # patched, so users keep full control of their names, queries, and schedules.
     "create_missing": True,
@@ -136,8 +143,35 @@ def _get_config(ctx):
     return merged
 
 
-def _hook(state, session_id=None, user_message=None, conversation_history=None,
-          is_first_turn=False, model=None, platform=None, **kwargs):
+def _broadcast_injection_recorded(summary):
+    """Tell an attached Desktop to refresh its memory pane.
+
+    The event carries audit metadata only: message content stays on disk and is
+    fetched through the authenticated dashboard REST route. Broadcasting is
+    best-effort and must never affect the turn.
+    """
+    try:
+        from hermes_cli.plugin_events import broadcast_plugin_event
+
+        broadcast_plugin_event(
+            core.PLUGIN_ID,
+            "injection.recorded",
+            {
+                "entry_id": summary.get("entry_id", ""),
+                "session_id": summary.get("session_id", ""),
+                "task_id": summary.get("task_id", ""),
+                "session_key": summary.get("session_key", ""),
+                "recorded_at": summary.get("recorded_at", ""),
+                "entry_count": summary.get("entry_count", 0),
+            },
+        )
+    except Exception as exc:
+        _logger.debug("hindsight-plus: could not broadcast injection event: %s", exc)
+
+
+def _hook(state, session_id=None, task_id=None, turn_id=None, user_message=None,
+          conversation_history=None, is_first_turn=False, model=None,
+          platform=None, **kwargs):
     try:
         cfg = state.config
         mode = _normalize_mode(cfg.get("mode"))
@@ -156,7 +190,8 @@ def _hook(state, session_id=None, user_message=None, conversation_history=None,
         if is_first_turn and session_id in state.guard:
             return None
 
-        text = core.build_injection(cfg, _logger)
+        details = core.build_injection_details(cfg, _logger)
+        text = (details or {}).get("text") or ""
         if not text:
             return None
 
@@ -171,6 +206,24 @@ def _hook(state, session_id=None, user_message=None, conversation_history=None,
 
         if is_first_turn:
             state.guard.add(session_id)
+
+        try:
+            summary = core.record_injection(
+                details,
+                cfg,
+                session_id=session_id,
+                task_id=task_id,
+                turn_id=turn_id,
+                user_message=user_message,
+                is_first_turn=is_first_turn,
+                platform=platform,
+                model=model,
+            )
+            if summary:
+                _broadcast_injection_recorded(summary)
+        except Exception as exc:  # auditing is fail-open, never lose the context
+            _logger.warning("hindsight-plus: injection audit failed: %s", exc)
+
         return {"context": text}
     except Exception as exc:  # never raise into the conversation
         _logger.warning("hindsight-plus: pre_llm_call failed: %s", exc)

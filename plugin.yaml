@@ -1,11 +1,12 @@
 manifest_version: 2
 name: hermes-hindsight-plus
-version: 0.4.0
+version: 0.5.0
 description: >-
   Inject Hindsight mental models into the first turn of every conversation,
   replacing hand-maintained MEMORY.md / USER.md files with stable,
   cron-refreshed context from your Hindsight bank. Creates missing models with
-  a daily refresh by default; existing models are never modified.
+  a daily refresh by default; existing models are never modified. A right-edge
+  Desktop pane shows the memory injected into the current chat.
 author: atostivint
 license: MIT
 homepage: https://github.com/atostivint/hermes-hindsight-plus
@@ -49,6 +50,25 @@ config_schema:
       deployment facts (instance, profiles, architecture) that should always be
       present. Empty by default. Do not put secrets here.
     default: ""
+  record_content:
+    type: bool
+    description: >-
+      Keep the injected text and a short user-message preview in the local
+      injection audit shown by the Desktop pane. Disable to keep metadata only
+      (timestamps, counts, model names). The audit never contains the API key.
+    default: true
+  audit_max_entries:
+    type: int
+    description: Maximum injection entries retained across all sessions (1-2000).
+    default: 200
+  audit_max_per_session:
+    type: int
+    description: Maximum injection entries retained per session (1-200).
+    default: 20
+  audit_max_sessions:
+    type: int
+    description: Maximum sessions retained in the local injection audit (1-500).
+    default: 50
   create_missing:
     type: bool
     description: >-
