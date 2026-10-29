@@ -22,6 +22,11 @@ never updates an existing model.
   `create_missing` is enabled. Never `PATCH`/`PUT`/`DELETE` an existing model, never write
   `MEMORY.md`/`USER.md`, never touch `memory.*` config, and never retain anything into the
   bank. An existing model's name, source query, schedule, and content are the user's.
+  **Narrow carve-out (opt-in Memory review page, `review.py`):** only on an explicit user
+  action in the Desktop page, `PATCH /v1/default/banks/{bank}/memories/{id}` may soft-invalidate
+  (`state=invalidated` + reason), restore (`state=valid`), or rewrite the text of a *memory
+  fact*, in banks `hermes|atlas|astro` only. Never `DELETE`, never automatically (an agent
+  verdict is advice, not an action), never on mental models, never from the hook.
 - **Creation is bounded.** Only on `404`; one POST per missing model; default
   `trigger.refresh_cron = "0 3 * * *"`; creation happens in the `pre_llm_call` hook, never
   in `register()` (Hermes requires registration to be I/O-free). Invalid model ids are
