@@ -409,7 +409,7 @@ function normalizeStateEntry(entry, bank) {
     count,
     injected_chars:
       entry && entry.injected_chars != null ? entry.injected_chars : text.length,
-    status: (entry && entry.status) || 'injected',
+    status: (entry && entry.status) || 'unknown',
     truncated: (entry && entry.status) === 'truncated',
     content: text,
     text,

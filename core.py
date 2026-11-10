@@ -1036,30 +1036,13 @@ _MEMORY_CONTEXT_CLOSE = "</memory-context>"
 _PLUGIN_BLOCK_MARKER = "## Stable context (Hindsight"
 
 
-def read_state_db_injections(*args, **kwargs) -> dict:
+def read_state_db_injections(session_id, hermes_home=None, limit=200) -> dict:
     """Read injection history from Hermes' read-only ``state.db``.
 
     Returns ``{"session", "entries", "source", "reason"?}``. ``source`` is
     ``"state.db"`` when the database could be read, ``"unavailable"`` otherwise.
     Never writes to the database.
-
-    Accepts ``session``/``session_id`` (positional or keyword), an optional
-    ``hermes_home`` (positional second arg or keyword) and ``limit``.
     """
-    session_id = kwargs.pop("session", None)
-    if session_id is None:
-        session_id = kwargs.pop("session_id", None)
-    hermes_home = kwargs.pop("hermes_home", None)
-    limit = kwargs.pop("limit", None)
-    if session_id is None and len(args) >= 1:
-        session_id = args[0]
-    if hermes_home is None and len(args) >= 2:
-        hermes_home = args[1]
-    if limit is None and len(args) >= 3:
-        limit = args[2]
-    if limit is None:
-        limit = 200
-
     session_id = _clean_id(session_id)
     limit = max(1, min(1000, _as_int(limit, 200)))
     result = {"session": session_id, "entries": [], "source": "unavailable"}
@@ -1132,7 +1115,15 @@ def read_state_db_injections(*args, **kwargs) -> dict:
                     open_idx + len(_MEMORY_CONTEXT_OPEN) : close_idx
                 ]
                 text = inner.strip()
-                count = sum(1 for line in inner.splitlines() if line.strip())
+                candidate_lines = [
+                    line for line in inner.splitlines()
+                    if line.strip() and not line.lstrip().startswith("[System note")
+                ]
+                bullet_lines = [
+                    line for line in candidate_lines
+                    if line.lstrip().startswith(("-", "*"))
+                ]
+                count = len(bullet_lines) if bullet_lines else len(candidate_lines)
                 status = "empty" if not text else "injected"
                 entries.append(
                     {
@@ -1181,16 +1172,6 @@ def read_state_db_injections(*args, **kwargs) -> dict:
     result["entries"] = entries
     result["source"] = "state.db"
     return result
-
-
-# Aliases for compatibility with callers/tests that use other names.
-read_state_injections = read_state_db_injections
-read_injections_from_state_db = read_state_db_injections
-read_injections = read_state_db_injections
-read_state_db = read_state_db_injections
-parse_state_db_injections = read_state_db_injections
-state_db_injections = read_state_db_injections
-get_injections = read_state_db_injections
 
 
 def list_injection_sessions(hermes_home=None, limit=100) -> dict:
