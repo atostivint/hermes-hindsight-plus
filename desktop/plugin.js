@@ -22,7 +22,9 @@ import {
   ROUTES_AREA,
   SIDEBAR_NAV_AREA,
   ScrollArea,
+  SegmentedControl,
   Streamdown,
+  Textarea,
   atom,
   host,
   useQuery,
@@ -813,6 +815,9 @@ function MemoryReviewPage() {
   const [pasted, setPasted] = useState('')
   const [busy, setBusy] = useState(false)
   const [notice, setNotice] = useState('')
+  const [view, setView] = useState('list')
+  const [docText, setDocText] = useState('')
+  const [docBase, setDocBase] = useState([])
   const queryClient = useQueryClient()
   const key = [ID, 'review', bank, state, offset]
 
@@ -824,9 +829,25 @@ function MemoryReviewPage() {
     retry: 1
   })
 
+  const docQuery = useQuery({
+    queryKey: [ID, 'review', bank, 'valid', 0, 'document'],
+    queryFn: () =>
+      reviewCall(`/review/${bank}/memories?limit=100&offset=0&state=valid&sort=staleness`),
+    staleTime: 10000,
+    retry: 1
+  })
+
   const items = sortReview(Array.isArray(query.data?.items) ? query.data.items : [], sort)
+  const docItems = sortReview(Array.isArray(docQuery.data?.items) ? docQuery.data.items : [], sort)
   const picked = items.filter(i => selected[i.id])
   const refresh = () => void queryClient.invalidateQueries({ queryKey: [ID, 'review'] })
+
+  useEffect(() => {
+    if (view !== 'document') return
+    const facts = docItems.length ? docItems : docQuery.data?.items || []
+    setDocBase(facts)
+    setDocText((facts || []).map(item => item.text || '').join('\\n'))
+  }, [view, docQuery.data])
 
   const onCheck = (id, on) => {
     const count = Object.values(selected).filter(Boolean).length
@@ -898,6 +919,99 @@ function MemoryReviewPage() {
     }
   }
 
+  const docLines = docText === '' ? [] : docText.split('\\n').filter(line => line.trim() !== '')
+  const docOriginalIds = docBase.map(item => item.id)
+  const docOriginalTexts = docBase.map(item => item.text || '')
+
+  const lcsPairs = (() => {
+    const m = docOriginalTexts.length
+    const n = docLines.length
+    const dp = Array.from({ length: m + 1 }, () => Array(n + 1).fill(0))
+    for (let i = m - 1; i >= 0; i -= 1) {
+      for (let j = n - 1; j >= 0; j -= 1) {
+        if (docOriginalTexts[i] === docLines[j]) dp[i][j] = 1 + dp[i + 1][j + 1]
+        else dp[i][j] = Math.max(dp[i + 1][j], dp[i][j + 1])
+      }
+    }
+    const pairs = []
+    let i = 0
+    let j = 0
+    while (i < m && j < n) {
+      if (docOriginalTexts[i] === docLines[j]) {
+        pairs.push([i, j])
+        i += 1
+        j += 1
+      } else if (dp[i + 1][j] >= dp[i][j + 1]) {
+        i += 1
+      } else {
+        j += 1
+      }
+    }
+    return pairs
+  })()
+
+  let docModified = 0
+  let docRemoved = 0
+  let docAdded = 0
+  const docUpdates = []
+  const docRemovals = []
+  let oi = 0
+  let ci = 0
+  for (const [mo, mc] of [...lcsPairs, [docOriginalTexts.length, docLines.length]]) {
+    const removedChunk = docOriginalTexts.slice(oi, mo)
+    const removedIds = docOriginalIds.slice(oi, mo)
+    const addedChunk = docLines.slice(ci, mc)
+    const paired = Math.min(removedChunk.length, addedChunk.length)
+    for (let k = 0; k < paired; k += 1) {
+      if (removedChunk[k] !== addedChunk[k]) {
+        docModified += 1
+        docUpdates.push({ id: removedIds[k], text: addedChunk[k] })
+      }
+    }
+    for (let k = paired; k < removedChunk.length; k += 1) {
+      docRemoved += 1
+      docRemovals.push({ id: removedIds[k], state: 'invalidated', reason: 'removed in document editor' })
+    }
+    docAdded += Math.max(0, addedChunk.length - removedChunk.length)
+    if (mo < docOriginalTexts.length && mc < docLines.length) {
+      oi = mo + 1
+      ci = mc + 1
+    } else {
+      oi = mo
+      ci = mc
+    }
+  }
+
+  const applyDocument = async () => {
+    const ops = [...docUpdates, ...docRemovals]
+    if (ops.length === 0) {
+      setNotice(docAdded > 0
+        ? 'Added lines are not created: no new memory is ever written.'
+        : 'No changes to apply.')
+      return
+    }
+    setBusy(true)
+    setNotice('')
+    try {
+      const result = await reviewPost(`/review/${bank}/apply`, ops)
+      const okCount = Array.isArray(result?.results)
+        ? result.results.filter(item => item && item.ok).length
+        : ops.length
+      setNotice(`Applied ${okCount}/${ops.length} change(s). Added lines were not created.`)
+      void queryClient.invalidateQueries({ queryKey: [ID, 'review'] })
+      const refreshed = await docQuery.refetch()
+      const facts = Array.isArray(refreshed?.data?.items)
+        ? refreshed.data.items
+        : (Array.isArray(docQuery.data?.items) ? docQuery.data.items : [])
+      setDocBase(sortReview(facts, sort))
+      setDocText(sortReview(facts, sort).map(item => item.text || '').join('\\n'))
+    } catch (error) {
+      setNotice(`Apply failed: ${String(error && error.message ? error.message : error)}`)
+    } finally {
+      setBusy(false)
+    }
+  }
+
   const select = (value, onChange, options) =>
     jsx('select', {
       style: rv.field,
@@ -906,6 +1020,64 @@ function MemoryReviewPage() {
       children: options.map(([v, label]) => jsx('option', { value: v, children: label }, v))
     })
 
+  if (view === 'document') {
+    return jsxs('div', {
+      style: rv.page,
+      children: [
+        jsxs('header', {
+          style: rv.bar,
+          children: [
+            jsx('div', { style: { ...styles.title, flex: 1 }, children: 'Memory review' }),
+            jsx(SegmentedControl, {
+              value: view,
+              onValueChange: setView,
+              options: [{ value: 'list', label: 'Liste' }, { value: 'document', label: 'Document' }]
+            }),
+            select(bank, v => { setBank(v); setOffset(0); setSelected({}) }, REVIEW_BANKS.map(b => [b, b])),
+            jsx(Button, {
+              type: 'button', size: 'icon-xs', variant: 'ghost', title: 'Refresh', 'aria-label': 'Refresh',
+              disabled: docQuery.isFetching, onClick: () => void docQuery.refetch(),
+              children: jsx(Codicon, { name: 'refresh', size: '0.8rem', spinning: docQuery.isFetching })
+            })
+          ]
+        }),
+        jsxs('div', {
+          style: { ...styles.note, margin: '8px 12px 0', display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' },
+          children: [
+            jsx('span', { style: { flex: 1 }, children: `${docLines.length} lignes · ${docModified} modifiees · ${docRemoved} supprimees` }),
+            docAdded > 0 ? jsx(Badge, { size: 'xs', variant: 'warn', children: `${docAdded} ajoutees ignorees` }) : null
+          ]
+        }),
+        docAdded > 0
+          ? jsx('div', { style: { ...styles.note, margin: '8px 12px 0' }, children: 'Les lignes ajoutees ne sont pas creees : le plugin n ecrit jamais un nouveau fait dans le banc.' })
+          : null,
+        notice
+          ? jsx('div', { style: { ...styles.note, margin: '8px 12px 0' }, children: notice })
+          : null,
+        jsx('div', {
+          style: styles.body,
+          children: jsx(Textarea, {
+            style: rv.textarea,
+            value: docText,
+            onChange: e => setDocText(e.target.value)
+          })
+        }),
+        jsxs('div', {
+          style: { padding: '8px 12px', display: 'flex', gap: 8, alignItems: 'center' },
+          children: [
+            jsx(Button, {
+              type: 'button', size: 'sm', variant: 'primary',
+              disabled: busy || (docUpdates.length === 0 && docRemovals.length === 0),
+              onClick: () => void applyDocument(),
+              children: 'Appliquer'
+            }),
+            jsx('span', { style: styles.footerText, children: docBase.length ? `${docBase.length} faits valides` : '' })
+          ]
+        })
+      ]
+    })
+  }
+
   return jsxs('div', {
     style: rv.page,
     children: [
@@ -913,6 +1085,11 @@ function MemoryReviewPage() {
         style: rv.bar,
         children: [
           jsx('div', { style: { ...styles.title, flex: 1 }, children: 'Memory review' }),
+          jsx(SegmentedControl, {
+            value: view,
+            onValueChange: setView,
+            options: [{ value: 'list', label: 'Liste' }, { value: 'document', label: 'Document' }]
+          }),
           select(bank, v => { setBank(v); setOffset(0); setSelected({}) }, REVIEW_BANKS.map(b => [b, b])),
           select(state, v => { setState(v); setOffset(0) }, [['valid', 'valid'], ['invalidated', 'revoked']]),
           select(sort, setSort, [['staleness', 'Sort: staleness'], ['age', 'Sort: age'], ['volatile', 'Sort: volatile']]),

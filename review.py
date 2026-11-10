@@ -309,6 +309,83 @@ def update(client, bank, memory_id, text):
     return _curate(client, bank, memory_id, {"text": text})
 
 
+DOCUMENT_REMOVAL_REASON = "removed in document editor"
+
+
+def apply_document(client, bank, operations):
+    """Apply a batch of document-style memory edits.
+
+    ``operations`` is a list of dicts, each either ``{"id": ..., "text": ...}``
+    (rewrite one fact) or
+    ``{"id": ..., "state": "invalidated", "reason": "removed in document editor"}``
+    (soft-revoke one fact). Every operation goes through ``patch_memory``; nothing
+    is created and nothing is physically deleted. A failure on one id does not
+    abort the rest of the batch; ``results`` carries ``ok`` per id.
+    """
+    check_bank(bank)
+    if not isinstance(operations, list):
+        raise ReviewError(400, "operations must be a list")
+
+    results = []
+    for op in operations:
+        if not isinstance(op, dict):
+            results.append({"id": None, "ok": False, "error": "operation must be an object", "status": 400})
+            continue
+        try:
+            memory_id = check_memory_id(str(op.get("id") or ""))
+        except ReviewError as exc:
+            results.append({"id": op.get("id"), "ok": False, "error": exc.message, "status": exc.status})
+            continue
+
+        state = str(op.get("state") or "").strip().lower()
+        if state == "invalidated":
+            try:
+                outcome = _curate(
+                    client, bank, memory_id,
+                    {"state": "invalidated", "reason": DOCUMENT_REMOVAL_REASON},
+                    require_state="valid",
+                )
+                results.append({
+                    "id": memory_id, "ok": True, "action": "remove",
+                    "previous": outcome["previous"], "current": outcome["current"],
+                })
+            except ReviewError as exc:
+                results.append({"id": memory_id, "ok": False, "error": exc.message, "status": exc.status})
+            except Exception:
+                results.append({"id": memory_id, "ok": False, "error": "memory review request failed", "status": 500})
+            continue
+
+        text_value = op.get("text")
+        if text_value is None:
+            text_value = op.get("new_text")
+        try:
+            text = check_text(text_value)
+            outcome = _curate(client, bank, memory_id, {"text": text})
+            results.append({
+                "id": memory_id, "ok": True, "action": "update",
+                "previous": outcome["previous"], "current": outcome["current"],
+            })
+        except ReviewError as exc:
+            results.append({"id": memory_id, "ok": False, "error": exc.message, "status": exc.status})
+        except Exception:
+            results.append({"id": memory_id, "ok": False, "error": "memory review request failed", "status": 500})
+
+    ok_ids = [r["id"] for r in results if r.get("ok")]
+    failed = [r for r in results if not r.get("ok")]
+    return {
+        "bank": bank,
+        "results": results,
+        "ok": ok_ids,
+        "failed": [r["id"] for r in failed],
+        "errors": {str(r["id"]): r["error"] for r in failed if r.get("id") is not None},
+        "updated": sum(1 for r in results if r.get("action") == "update" and r.get("ok")),
+        "removed": sum(1 for r in results if r.get("action") == "remove" and r.get("ok")),
+    }
+
+
+apply = apply_document
+
+
 # --- prompt for the "Check with Hermes" chat -----------------------------------
 
 MAX_CHECK_FACTS = 10
