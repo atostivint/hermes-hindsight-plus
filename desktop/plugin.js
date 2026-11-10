@@ -1237,8 +1237,8 @@ function MemoryReviewPage() {
             jsx('div', { style: { ...styles.title, flex: 1 }, children: 'Memory review' }),
             jsx(SegmentedControl, {
               value: view,
-              onValueChange: setView,
-              options: [{ value: 'list', label: 'Liste' }, { value: 'document', label: 'Document' }]
+              onChange: setView,
+              options: [{ id: 'list', label: 'Liste' }, { id: 'document', label: 'Document' }]
             }),
             select(bank, v => { setBank(v); setOffset(0); setSelected({}) }, REVIEW_BANKS.map(b => [b, b])),
             jsx(Button, {
@@ -1294,8 +1294,8 @@ function MemoryReviewPage() {
           jsx('div', { style: { ...styles.title, flex: 1 }, children: 'Memory review' }),
           jsx(SegmentedControl, {
             value: view,
-            onValueChange: setView,
-            options: [{ value: 'list', label: 'Liste' }, { value: 'document', label: 'Document' }]
+            onChange: setView,
+            options: [{ id: 'list', label: 'Liste' }, { id: 'document', label: 'Document' }]
           }),
           select(bank, v => { setBank(v); setOffset(0); setSelected({}) }, REVIEW_BANKS.map(b => [b, b])),
           select(state, v => { setState(v); setOffset(0) }, [['valid', 'valid'], ['invalidated', 'revoked']]),
