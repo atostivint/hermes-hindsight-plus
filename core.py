@@ -878,6 +878,13 @@ def record_injection(
         if not session_id and not task_id:
             return None
 
+        home = pathlib.Path(hermes_home) if hermes_home else _hermes_home()
+        try:
+            _api_url, bank_id, _api_key = resolve_endpoint(home)
+        except Exception:
+            bank_id = ""
+        bank_id = str(bank_id or "")[:128]
+
         config = config if isinstance(config, dict) else {}
         record_content = _as_bool(config.get("record_content"), True)
         max_total, max_per_session, max_sessions = _audit_limits(config)
@@ -914,6 +921,7 @@ def record_injection(
             entry = {
                 "id": entry_id,
                 "recorded_at": now,
+                "bank": bank_id,
                 "session_id": session_id,
                 "task_id": task_id,
                 "turn_id": _clean_id(turn_id),
@@ -960,8 +968,15 @@ def read_injection_history(session_id, hermes_home=None, limit=200) -> dict:
     """Return one session's retained injections, newest first."""
     session_id = _clean_id(session_id)
     limit = max(1, min(1000, _as_int(limit, 200)))
-    result = {"schema": AUDIT_SCHEMA, "session": None, "entries": []}
+    result = {"schema": AUDIT_SCHEMA, "session": None, "entries": [], "bank": ""}
     if not session_id:
+        try:
+            _api_url, bank_id, _api_key = resolve_endpoint(
+                pathlib.Path(hermes_home) if hermes_home else _hermes_home()
+            )
+            result["bank"] = str(bank_id or "")
+        except Exception:
+            pass
         return result
 
     path = _audit_path(hermes_home)
@@ -973,6 +988,19 @@ def read_injection_history(session_id, hermes_home=None, limit=200) -> dict:
     bucket = data["sessions"][key]
     result["session"] = _session_summary(key, bucket)
     result["entries"] = list(reversed(bucket.get("entries") or []))[:limit]
+    if not result["bank"]:
+        try:
+            _api_url, bank_id, _api_key = resolve_endpoint(
+                pathlib.Path(hermes_home) if hermes_home else _hermes_home()
+            )
+            result["bank"] = str(bank_id or "")
+        except Exception:
+            pass
+    if not result["bank"]:
+        for entry in result["entries"]:
+            if isinstance(entry, dict) and entry.get("bank"):
+                result["bank"] = str(entry.get("bank"))
+                break
     return result
 
 

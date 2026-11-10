@@ -40,6 +40,7 @@ const PANE_ID = `${ID}:memory`
 
 let rest = null
 const liveRevision = atom(0)
+const providerRecalls = atom([])
 
 const styles = {
   root: {
@@ -199,6 +200,16 @@ function useScope() {
   return String(stored || live || '').trim()
 }
 
+function useProviderEntries(scope) {
+  const recalls = useValue(providerRecalls)
+  if (!scope || !Array.isArray(recalls)) return []
+  return recalls.filter(entry => {
+    if (!entry) return false
+    const sid = String(entry.session_id || '')
+    return sid === scope || sid.endsWith(scope) || scope.endsWith(sid)
+  })
+}
+
 function useHistory(scope) {
   const revision = useValue(liveRevision)
   const queryClient = useQueryClient()
@@ -269,23 +280,99 @@ function modelText(models) {
 }
 
 function entryMeta(entry) {
-  const bits = [entry.is_first_turn ? 'First turn' : 'Later turn']
-  bits.push(modelText(entry.models))
-  bits.push(`${formatNumber(entry.injected_chars)} chars`)
-  if (entry.context_note_chars > 0) bits.push('deployment note')
+  const bits = [entry.source || 'injection', entry.status || 'injected']
+  if (entry.bank) bits.push(entry.bank)
+  if (entry.count != null) bits.push(`${formatNumber(entry.count)} memories`)
+  if (entry.injected_chars != null) bits.push(`${formatNumber(entry.injected_chars)} chars`)
   return bits.join(' • ')
 }
 
 function entryDetails(entry) {
-  const bits = [
-    `Injected ${formatNumber(entry.injected_chars)} of ${formatNumber(entry.assembled_chars)} characters`,
-    `budget ${formatNumber(entry.max_chars)}`
-  ]
+  const bits = []
+  if (entry.bank) bits.push(`bank ${entry.bank}`)
+  if (entry.count != null) bits.push(`${formatNumber(entry.count)} memories`)
+  if (entry.injected_chars != null) {
+    bits.push(`injected ${formatNumber(entry.injected_chars)} chars`)
+  } else {
+    bits.push('size unavailable')
+  }
   if (entry.truncated) bits.push('truncated to fit')
   if (entry.turn_id) bits.push(`turn ${entry.turn_id}`)
   if (entry.model) bits.push(`model ${entry.model}`)
   if (entry.platform) bits.push(`platform ${entry.platform}`)
+  if (entry.content_recorded === false && entry.source === 'plugin mental-models') {
+    bits.push('content recording off')
+  }
   return bits.join(' • ')
+}
+
+function normalizePluginEntry(entry, bank) {
+  const models = Array.isArray(entry && entry.models) ? entry.models : []
+  return {
+    id: entry && entry.id,
+    recorded_at: entry && entry.recorded_at,
+    source: 'plugin mental-models',
+    bank: (entry && entry.bank) || bank || '—',
+    count: models.length,
+    injected_chars:
+      entry && entry.injected_chars != null ? entry.injected_chars : null,
+    status:
+      entry && entry.truncated
+        ? 'truncated'
+        : entry && Number(entry.injected_chars) > 0
+          ? 'injected'
+          : 'empty',
+    truncated: Boolean(entry && entry.truncated),
+    content: entry && typeof entry.content === 'string' ? entry.content : '',
+    content_recorded: Boolean(entry && entry.content_recorded),
+    user_preview: (entry && entry.user_preview) || '',
+    turn_id: entry && entry.turn_id,
+    model: entry && entry.model,
+    platform: entry && entry.platform,
+    models
+  }
+}
+
+function normalizeProviderEntry(entry, bank) {
+  const text = entry && entry.text ? String(entry.text) : ''
+  const match = text.match(/recalled\\s+(\\d+)\\s+memor/i)
+  const count = match
+    ? Number(match[1])
+    : /recalled relevant memory/i.test(text)
+      ? 1
+      : 0
+  return {
+    id: entry && entry.id,
+    recorded_at: (entry && entry.recorded_at) || new Date().toISOString(),
+    source: 'provider recall',
+    bank: (entry && entry.bank) || bank || '—',
+    count,
+    injected_chars:
+      entry && entry.injected_chars != null ? entry.injected_chars : null,
+    status: (entry && entry.status) || 'injected',
+    truncated: false,
+    content: (entry && entry.content) || '',
+    content_recorded: false,
+    user_preview: '',
+    turn_id: (entry && entry.turn_id) || '',
+    model: '',
+    platform: (entry && entry.platform) || '',
+    models: []
+  }
+}
+
+function useHealthBank() {
+  const query = useQuery({
+    queryKey: [ID, 'health'],
+    queryFn: () => {
+      if (!rest) return Promise.reject(new Error('The plugin API is not available yet.'))
+      return rest('/health', { timeoutMs: 5000 })
+    },
+    enabled: Boolean(rest),
+    staleTime: 30000,
+    retry: 1
+  })
+  return query && query.data ? query.data.bank : null
 }
 
 function InjectionEntry({ entry, initiallyOpen }) {
@@ -354,20 +441,22 @@ function InjectionEntry({ entry, initiallyOpen }) {
                     children: `“${entry.user_preview}”`
                   })
                 : null,
-              entry.content_recorded
-                ? content
+              entry.source === 'provider recall'
+                ? jsx('div', { style: styles.note, children: 'Provider recall captured from the live status line. Count and bank are shown above; the injected text is not available in this pane.' })
+                : entry.content_recorded
+                  ? content
                   ? jsx('div', {
                       style: styles.content,
                       children: raw
                         ? jsx('pre', {
                             style: styles.pre,
-                            children: content
+                            children: content.length > 320 ? `${content.slice(0, 320)}…` : content
                           })
                         : jsx(Streamdown, {
                             controls: false,
                             mode: 'static',
                             parseIncompleteMarkdown: false,
-                            children: content
+                            children: content.length > 320 ? `${content.slice(0, 320)}…` : content
                           })
                     })
                   : jsx('div', {
@@ -450,7 +539,20 @@ function MemoryTabTitle() {
 
 function PaneBody({ scope, history }) {
   const { data, error, isFetching, isLoading, refetch } = history
-  const entries = Array.isArray(data?.entries) ? data.entries : []
+  const healthBank = useHealthBank()
+  const bank = (data && data.bank) || healthBank
+  const pluginEntries = Array.isArray(data?.entries) ? data.entries : []
+  const providerEntries = useProviderEntries(scope).map(entry =>
+    normalizeProviderEntry(entry, bank)
+  )
+  const entries = [
+    ...pluginEntries.map(entry => normalizePluginEntry(entry, bank)),
+    ...providerEntries
+  ].sort((a, b) => {
+    const left = new Date(b.recorded_at).getTime()
+    const right = new Date(a.recorded_at).getTime()
+    return (Number.isFinite(left) ? left : 0) - (Number.isFinite(right) ? right : 0)
+  })
 
   if (!scope) {
     return jsx('div', {
@@ -518,7 +620,11 @@ function MemoryPane() {
   const scope = useScope()
   const history = useHistory(scope)
   const data = history.data
-  const entries = Array.isArray(data?.entries) ? data.entries : []
+  const providerEntries = useProviderEntries(scope)
+  const entries = [
+    ...(Array.isArray(data?.entries) ? data.entries : []),
+    ...providerEntries
+  ]
   const latest = entries[0]
   const subtitle = latest
     ? `${entries.length} ${entries.length === 1 ? 'injection' : 'injections'} • latest ${formatWhen(latest.recorded_at)}`
@@ -1189,6 +1295,27 @@ export default {
     rest = ctx.rest
 
     ctx.onEvent(EVENT, () => {
+      liveRevision.set(liveRevision.get() + 1)
+    })
+
+    ctx.onEvent('status.update', event => {
+      const sid =
+        (event && (event.session_id || (event.params && event.params.session_id))) || ''
+      const payload =
+        (event && (event.payload || (event.params && event.params.payload))) || {}
+      const text = payload && payload.text ? String(payload.text) : ''
+      if (!sid || !/recalled|Hindsight/i.test(text)) return
+      const entry = {
+        id: `${Date.now()}-${Math.random().toString(16).slice(2)}`,
+        session_id: sid,
+        recorded_at: new Date().toISOString(),
+        text,
+        bank: null,
+        injected_chars: null,
+        status: 'injected',
+        platform: ''
+      }
+      providerRecalls.set(providerRecalls.get().concat([entry]))
       liveRevision.set(liveRevision.get() + 1)
     })
 
