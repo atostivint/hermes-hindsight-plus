@@ -21,6 +21,7 @@ import threading
 from typing import Annotated
 
 from fastapi import APIRouter, Body, HTTPException, Query
+from typing import Any
 
 PLUGIN_ID = "hermes-hindsight-plus"
 _CORE_MODULE = "hermes_hindsight_plus_dashboard_core"
@@ -162,6 +163,19 @@ def review_verdicts(payload: Annotated[dict, Body()]):
     ids = data.get("ids") if isinstance(data.get("ids"), list) else []
     return _review_call(
         lambda: {"verdicts": _review().parse_verdicts(data.get("reply"), ids)}
+    )
+
+
+@router.post("/review/{bank}/apply")
+def review_apply(bank: str, payload: Annotated[Any, Body()] = None):
+    """Apply a document-style batch of memory edits.
+
+    Each entry is either ``{id, text}`` (rewrite) or
+    ``{id, state: "invalidated", reason: "removed in document editor"}``
+    (soft revoke). Nothing is created or physically deleted.
+    """
+    return _review_call(
+        lambda: _review().apply(_review_client(), bank, payload)
     )
 
 

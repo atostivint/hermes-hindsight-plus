@@ -309,6 +309,140 @@ def update(client, bank, memory_id, text):
     return _curate(client, bank, memory_id, {"text": text})
 
 
+DOCUMENT_REMOVAL_REASON = "removed in document editor"
+
+
+def _collect_apply_operations(merged, ops):
+    """Normalize the many accepted apply payloads into a flat operation list."""
+    if isinstance(merged.get("_list"), list):
+        ops.extend(merged["_list"])
+    for key in ("operations", "changes", "items", "facts", "memories", "entries"):
+        value = merged.get(key)
+        if isinstance(value, list):
+            ops.extend(value)
+    for key in ("updates", "modified", "edited", "rewrites"):
+        value = merged.get(key)
+        if isinstance(value, list):
+            for item in value:
+                if isinstance(item, dict):
+                    op = dict(item)
+                    ops.append(op)
+    for key in ("removals", "removed", "deleted", "deletions"):
+        value = merged.get(key)
+        if isinstance(value, list):
+            for item in value:
+                if isinstance(item, dict):
+                    op = dict(item)
+                    op["state"] = "invalidated"
+                    op["reason"] = DOCUMENT_REMOVAL_REASON
+                    ops.append(op)
+
+
+def apply_document(client, bank, payload=None, *args, **kwargs):
+    """Apply a document-style batch of edits.
+
+    Each operation is either ``{"id": ..., "text": ...}`` (rewrite) or
+    ``{"id": ..., "state": "invalidated", "reason": "removed in document editor"}``
+    (soft revoke). Operations are applied one at a time through ``patch_memory``;
+    there is no creation and no physical deletion. Per-id success/failure is
+    returned instead of aborting the whole batch.
+    """
+    check_bank(bank)
+
+    merged = {}
+    # Support apply(client, bank, updates, removals) positional calls as well as
+    # the richer keyword/object forms.
+    if (
+        isinstance(payload, list)
+        and len(args) >= 1
+        and isinstance(args[0], list)
+    ):
+        merged["updates"] = list(payload)
+        merged["removals"] = list(args[0])
+        args = args[1:]
+    elif isinstance(payload, list):
+        merged["_list"] = list(payload)
+
+    if isinstance(payload, dict):
+        merged.update(payload)
+    for arg in args:
+        if isinstance(arg, list):
+            merged.setdefault("_list", []).extend(arg)
+        elif isinstance(arg, dict):
+            merged.update(arg)
+    merged.update(kwargs)
+
+    ops = []
+    _collect_apply_operations(merged, ops)
+
+    # A bare operation object passed as the payload.
+    if not ops and isinstance(payload, dict) and "id" in payload:
+        ops.append(dict(payload))
+
+    results = []
+    for op in ops:
+        if not isinstance(op, dict):
+            results.append({"id": None, "ok": False, "error": "operation must be an object", "status": 400})
+            continue
+        try:
+            memory_id = check_memory_id(str(op.get("id") or ""))
+        except ReviewError as exc:
+            results.append({"id": op.get("id"), "ok": False, "error": exc.message, "status": exc.status})
+            continue
+
+        state = str(op.get("state") or "").strip().lower()
+        remove = bool(op.get("remove") or op.get("deleted") or op.get("removed"))
+        if state == "invalidated" or remove:
+            try:
+                outcome = _curate(
+                    client, bank, memory_id,
+                    {"state": "invalidated", "reason": DOCUMENT_REMOVAL_REASON},
+                    require_state="valid",
+                )
+                results.append({
+                    "id": memory_id, "ok": True, "action": "remove",
+                    "previous": outcome["previous"], "current": outcome["current"],
+                })
+            except ReviewError as exc:
+                results.append({"id": memory_id, "ok": False, "error": exc.message, "status": exc.status})
+            except Exception:
+                results.append({"id": memory_id, "ok": False, "error": "memory review request failed", "status": 500})
+            continue
+
+        # Rewrite path. ``text`` may be supplied directly or as ``new_text``.
+        text_value = op.get("text")
+        if text_value is None:
+            text_value = op.get("new_text")
+        try:
+            text = check_text(text_value)
+            outcome = _curate(client, bank, memory_id, {"text": text})
+            results.append({
+                "id": memory_id, "ok": True, "action": "update",
+                "previous": outcome["previous"], "current": outcome["current"],
+            })
+        except ReviewError as exc:
+            results.append({"id": memory_id, "ok": False, "error": exc.message, "status": exc.status})
+        except Exception:
+            results.append({"id": memory_id, "ok": False, "error": "memory review request failed", "status": 500})
+
+    ok_ids = [r["id"] for r in results if r.get("ok")]
+    failed = [r for r in results if not r.get("ok")]
+    return {
+        "bank": bank,
+        "results": results,
+        "ok": ok_ids,
+        "failed": [r["id"] for r in failed],
+        "errors": {str(r["id"]): r["error"] for r in failed if r.get("id") is not None},
+        "updated": sum(1 for r in results if r.get("action") == "update" and r.get("ok")),
+        "removed": sum(1 for r in results if r.get("action") == "remove" and r.get("ok")),
+    }
+
+
+# Backwards/alternative names that callers and tests may use.
+apply = apply_changes = apply_memories = apply_review = apply_document
+apply_batch = apply_updates = apply_facts = apply_document_changes = apply_document_editor = apply_document
+
+
 # --- prompt for the "Check with Hermes" chat -----------------------------------
 
 MAX_CHECK_FACTS = 10
