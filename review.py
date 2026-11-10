@@ -312,75 +312,22 @@ def update(client, bank, memory_id, text):
 DOCUMENT_REMOVAL_REASON = "removed in document editor"
 
 
-def _collect_apply_operations(merged, ops):
-    """Normalize the many accepted apply payloads into a flat operation list."""
-    if isinstance(merged.get("_list"), list):
-        ops.extend(merged["_list"])
-    for key in ("operations", "changes", "items", "facts", "memories", "entries"):
-        value = merged.get(key)
-        if isinstance(value, list):
-            ops.extend(value)
-    for key in ("updates", "modified", "edited", "rewrites"):
-        value = merged.get(key)
-        if isinstance(value, list):
-            for item in value:
-                if isinstance(item, dict):
-                    op = dict(item)
-                    ops.append(op)
-    for key in ("removals", "removed", "deleted", "deletions"):
-        value = merged.get(key)
-        if isinstance(value, list):
-            for item in value:
-                if isinstance(item, dict):
-                    op = dict(item)
-                    op["state"] = "invalidated"
-                    op["reason"] = DOCUMENT_REMOVAL_REASON
-                    ops.append(op)
+def apply_document(client, bank, operations):
+    """Apply a batch of document-style memory edits.
 
-
-def apply_document(client, bank, payload=None, *args, **kwargs):
-    """Apply a document-style batch of edits.
-
-    Each operation is either ``{"id": ..., "text": ...}`` (rewrite) or
+    ``operations`` is a list of dicts, each either ``{"id": ..., "text": ...}``
+    (rewrite one fact) or
     ``{"id": ..., "state": "invalidated", "reason": "removed in document editor"}``
-    (soft revoke). Operations are applied one at a time through ``patch_memory``;
-    there is no creation and no physical deletion. Per-id success/failure is
-    returned instead of aborting the whole batch.
+    (soft-revoke one fact). Every operation goes through ``patch_memory``; nothing
+    is created and nothing is physically deleted. A failure on one id does not
+    abort the rest of the batch; ``results`` carries ``ok`` per id.
     """
     check_bank(bank)
-
-    merged = {}
-    # Support apply(client, bank, updates, removals) positional calls as well as
-    # the richer keyword/object forms.
-    if (
-        isinstance(payload, list)
-        and len(args) >= 1
-        and isinstance(args[0], list)
-    ):
-        merged["updates"] = list(payload)
-        merged["removals"] = list(args[0])
-        args = args[1:]
-    elif isinstance(payload, list):
-        merged["_list"] = list(payload)
-
-    if isinstance(payload, dict):
-        merged.update(payload)
-    for arg in args:
-        if isinstance(arg, list):
-            merged.setdefault("_list", []).extend(arg)
-        elif isinstance(arg, dict):
-            merged.update(arg)
-    merged.update(kwargs)
-
-    ops = []
-    _collect_apply_operations(merged, ops)
-
-    # A bare operation object passed as the payload.
-    if not ops and isinstance(payload, dict) and "id" in payload:
-        ops.append(dict(payload))
+    if not isinstance(operations, list):
+        raise ReviewError(400, "operations must be a list")
 
     results = []
-    for op in ops:
+    for op in operations:
         if not isinstance(op, dict):
             results.append({"id": None, "ok": False, "error": "operation must be an object", "status": 400})
             continue
@@ -391,8 +338,7 @@ def apply_document(client, bank, payload=None, *args, **kwargs):
             continue
 
         state = str(op.get("state") or "").strip().lower()
-        remove = bool(op.get("remove") or op.get("deleted") or op.get("removed"))
-        if state == "invalidated" or remove:
+        if state == "invalidated":
             try:
                 outcome = _curate(
                     client, bank, memory_id,
@@ -409,7 +355,6 @@ def apply_document(client, bank, payload=None, *args, **kwargs):
                 results.append({"id": memory_id, "ok": False, "error": "memory review request failed", "status": 500})
             continue
 
-        # Rewrite path. ``text`` may be supplied directly or as ``new_text``.
         text_value = op.get("text")
         if text_value is None:
             text_value = op.get("new_text")
@@ -438,9 +383,7 @@ def apply_document(client, bank, payload=None, *args, **kwargs):
     }
 
 
-# Backwards/alternative names that callers and tests may use.
-apply = apply_changes = apply_memories = apply_review = apply_document
-apply_batch = apply_updates = apply_facts = apply_document_changes = apply_document_editor = apply_document
+apply = apply_document
 
 
 # --- prompt for the "Check with Hermes" chat -----------------------------------

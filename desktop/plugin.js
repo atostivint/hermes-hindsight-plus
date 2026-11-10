@@ -922,22 +922,63 @@ function MemoryReviewPage() {
   const docLines = docText === '' ? [] : docText.split('\\n').filter(line => line.trim() !== '')
   const docOriginalIds = docBase.map(item => item.id)
   const docOriginalTexts = docBase.map(item => item.text || '')
+
+  const lcsPairs = (() => {
+    const m = docOriginalTexts.length
+    const n = docLines.length
+    const dp = Array.from({ length: m + 1 }, () => Array(n + 1).fill(0))
+    for (let i = m - 1; i >= 0; i -= 1) {
+      for (let j = n - 1; j >= 0; j -= 1) {
+        if (docOriginalTexts[i] === docLines[j]) dp[i][j] = 1 + dp[i + 1][j + 1]
+        else dp[i][j] = Math.max(dp[i + 1][j], dp[i][j + 1])
+      }
+    }
+    const pairs = []
+    let i = 0
+    let j = 0
+    while (i < m && j < n) {
+      if (docOriginalTexts[i] === docLines[j]) {
+        pairs.push([i, j])
+        i += 1
+        j += 1
+      } else if (dp[i + 1][j] >= dp[i][j + 1]) {
+        i += 1
+      } else {
+        j += 1
+      }
+    }
+    return pairs
+  })()
+
   let docModified = 0
   let docRemoved = 0
   let docAdded = 0
   const docUpdates = []
   const docRemovals = []
-  for (let i = 0; i < Math.max(docLines.length, docOriginalIds.length); i += 1) {
-    if (i < docLines.length && i < docOriginalIds.length) {
-      if (docLines[i] !== docOriginalTexts[i]) {
+  let oi = 0
+  let ci = 0
+  for (const [mo, mc] of [...lcsPairs, [docOriginalTexts.length, docLines.length]]) {
+    const removedChunk = docOriginalTexts.slice(oi, mo)
+    const removedIds = docOriginalIds.slice(oi, mo)
+    const addedChunk = docLines.slice(ci, mc)
+    const paired = Math.min(removedChunk.length, addedChunk.length)
+    for (let k = 0; k < paired; k += 1) {
+      if (removedChunk[k] !== addedChunk[k]) {
         docModified += 1
-        docUpdates.push({ id: docOriginalIds[i], text: docLines[i] })
+        docUpdates.push({ id: removedIds[k], text: addedChunk[k] })
       }
-    } else if (i >= docLines.length && i < docOriginalIds.length) {
+    }
+    for (let k = paired; k < removedChunk.length; k += 1) {
       docRemoved += 1
-      docRemovals.push({ id: docOriginalIds[i], state: 'invalidated', reason: 'removed in document editor' })
-    } else if (i >= docOriginalIds.length && i < docLines.length) {
-      docAdded += 1
+      docRemovals.push({ id: removedIds[k], state: 'invalidated', reason: 'removed in document editor' })
+    }
+    docAdded += Math.max(0, addedChunk.length - removedChunk.length)
+    if (mo < docOriginalTexts.length && mc < docLines.length) {
+      oi = mo + 1
+      ci = mc + 1
+    } else {
+      oi = mo
+      ci = mc
     }
   }
 
@@ -958,7 +999,10 @@ function MemoryReviewPage() {
         : ops.length
       setNotice(`Applied ${okCount}/${ops.length} change(s). Added lines were not created.`)
       void queryClient.invalidateQueries({ queryKey: [ID, 'review'] })
-      const facts = Array.isArray(docQuery.data?.items) ? docQuery.data.items : []
+      const refreshed = await docQuery.refetch()
+      const facts = Array.isArray(refreshed?.data?.items)
+        ? refreshed.data.items
+        : (Array.isArray(docQuery.data?.items) ? docQuery.data.items : [])
       setDocBase(sortReview(facts, sort))
       setDocText(sortReview(facts, sort).map(item => item.text || '').join('\\n'))
     } catch (error) {
