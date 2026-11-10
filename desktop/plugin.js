@@ -311,6 +311,7 @@ function entryMeta(entry) {
   const bits = [entry.source || 'injection', entry.status || 'injected']
   if (entry.bank) bits.push(entry.bank)
   if (entry.count != null) bits.push(`${formatNumber(entry.count)} memories`)
+  else bits.push('—')
   if (entry.injected_chars != null) bits.push(`${formatNumber(entry.injected_chars)} chars`)
   return bits.join(' • ')
 }
@@ -319,6 +320,7 @@ function entryDetails(entry) {
   const bits = []
   if (entry.bank) bits.push(`bank ${entry.bank}`)
   if (entry.count != null) bits.push(`${formatNumber(entry.count)} memories`)
+  else bits.push('—')
   if (entry.injected_chars != null) {
     bits.push(`injected ${formatNumber(entry.injected_chars)} chars`)
   } else {
@@ -400,7 +402,7 @@ function normalizeStateEntry(entry, bank) {
       ? entry.count
       : source === 'plugin mental-models'
         ? (text.match(/^## /gm) || []).length
-        : 0
+        : null
   return {
     id: entry && entry.id,
     recorded_at: (entry && entry.recorded_at) || new Date().toISOString(),

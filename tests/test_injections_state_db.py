@@ -47,6 +47,27 @@ def test_state_db_injections_parse_and_count(core, tmp_path):
     ][0]
     assert provider["count"] == 2
     assert plugin_entry["count"] == 2
+    assert "System note" not in (provider["text"] or "")
+
+
+def test_state_db_injections_prose_without_bullet(core, tmp_path):
+    mem = (
+        "<memory-context>\n"
+        "[System note: recalled 1 memories]\n"
+        "a plain memory line without bullet\n"
+        "</memory-context>"
+    )
+    api = "q\n\n" + mem + "\n\n## Stable context (Hindsight x)\n\nhi"
+    _make_db(
+        tmp_path,
+        [(1, "sess1", "user", "q", 1731234567.0, 1, api)],
+    )
+
+    result = core.read_state_db_injections("sess1", hermes_home=tmp_path, limit=200)
+
+    provider = [e for e in result["entries"] if e["source"] == "provider recall"][0]
+    assert provider["count"] is None
+    assert "System note" not in (provider["text"] or "")
 
 
 def test_state_db_injections_empty_memory_status(core, tmp_path):

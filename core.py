@@ -1114,16 +1114,27 @@ def read_state_db_injections(session_id, hermes_home=None, limit=200) -> dict:
                 inner = api_content[
                     open_idx + len(_MEMORY_CONTEXT_OPEN) : close_idx
                 ]
-                text = inner.strip()
-                candidate_lines = [
-                    line for line in inner.splitlines()
-                    if line.strip() and not line.lstrip().startswith("[System note")
-                ]
+                lines = inner.splitlines()
+                start = 0
+                while start < len(lines) and not lines[start].strip():
+                    start += 1
+                split_at = next(
+                    (i for i in range(start, len(lines)) if not lines[i].strip()),
+                    None,
+                )
+                if split_at is None:
+                    memory_lines = [
+                        line for line in lines[start:]
+                        if not line.lstrip().startswith("[System note")
+                    ]
+                else:
+                    memory_lines = lines[split_at + 1:]
+                text = "\n".join(memory_lines).strip()
                 bullet_lines = [
-                    line for line in candidate_lines
+                    line for line in memory_lines
                     if line.lstrip().startswith(("-", "*"))
                 ]
-                count = len(bullet_lines) if bullet_lines else len(candidate_lines)
+                count = len(bullet_lines) if bullet_lines else None
                 status = "empty" if not text else "injected"
                 entries.append(
                     {
