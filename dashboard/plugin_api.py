@@ -187,7 +187,8 @@ def health():
     """Return audit-store statistics without exposing its filesystem path."""
     try:
         stats = _core().injection_audit_stats()
-        return {"ok": True, **stats}
+        _api_url, bank_id, _api_key = _core().resolve_endpoint(_core()._hermes_home())
+        return {"ok": True, "bank": bank_id or "", **stats}
     except Exception as exc:
         raise HTTPException(
             status_code=500, detail="could not read the injection audit"
