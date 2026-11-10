@@ -11,7 +11,7 @@ NOW_ISO = "2026-01-01T00:00:00+00:00"
 
 
 def _load_review():
-    spec = importlib.util.spec_from_file_location("hh_review_document_test", ROOT / "REVIEW.py")
+    spec = importlib.util.spec_from_file_location("hh_review_document_test", ROOT / "review.py")
     module = importlib.util.module_from_spec(spec)
     sys.modules["hh_review_document_test"] = module
     spec.loader.exec_module(module)
