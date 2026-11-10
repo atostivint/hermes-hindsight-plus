@@ -13,6 +13,7 @@ import logging
 import os
 import pathlib
 import re
+import sqlite3
 import threading
 import time
 import urllib.error
@@ -1002,6 +1003,194 @@ def read_injection_history(session_id, hermes_home=None, limit=200) -> dict:
                 result["bank"] = str(entry.get("bank"))
                 break
     return result
+
+
+def _state_db_timestamp_to_iso(value):
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return ""
+        try:
+            dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except (ValueError, TypeError):
+            return text
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.isoformat()
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return str(value)
+    if number > 1e12:
+        number = number / 1000.0
+    try:
+        return datetime.fromtimestamp(number, tz=timezone.utc).isoformat()
+    except (OSError, ValueError, OverflowError):
+        return str(value)
+
+
+_MEMORY_CONTEXT_OPEN = "<memory-context>"
+_MEMORY_CONTEXT_CLOSE = "</memory-context>"
+_PLUGIN_BLOCK_MARKER = "## Stable context (Hindsight"
+
+
+def read_state_db_injections(*args, **kwargs) -> dict:
+    """Read injection history from Hermes' read-only ``state.db``.
+
+    Returns ``{"session", "entries", "source", "reason"?}``. ``source`` is
+    ``"state.db"`` when the database could be read, ``"unavailable"`` otherwise.
+    Never writes to the database.
+
+    Accepts ``session``/``session_id`` (positional or keyword), an optional
+    ``hermes_home`` (positional second arg or keyword) and ``limit``.
+    """
+    session_id = kwargs.pop("session", None)
+    if session_id is None:
+        session_id = kwargs.pop("session_id", None)
+    hermes_home = kwargs.pop("hermes_home", None)
+    limit = kwargs.pop("limit", None)
+    if session_id is None and len(args) >= 1:
+        session_id = args[0]
+    if hermes_home is None and len(args) >= 2:
+        hermes_home = args[1]
+    if limit is None and len(args) >= 3:
+        limit = args[2]
+    if limit is None:
+        limit = 200
+
+    session_id = _clean_id(session_id)
+    limit = max(1, min(1000, _as_int(limit, 200)))
+    result = {"session": session_id, "entries": [], "source": "unavailable"}
+
+    home = pathlib.Path(hermes_home) if hermes_home else _hermes_home()
+    db_path = home / "state.db"
+
+    # Resolve the configured bank once; failures leave it empty rather than
+    # aborting the whole read.
+    bank_id = ""
+    try:
+        _api_url, resolved_bank, _api_key = resolve_endpoint(home)
+        bank_id = str(resolved_bank or "")
+    except Exception:
+        bank_id = ""
+
+    if not db_path.is_file():
+        result["reason"] = "state.db not found"
+        return result
+
+    conn = None
+    try:
+        conn = sqlite3.connect(
+            db_path.resolve().as_uri() + "?mode=ro",
+            uri=True,
+            timeout=2.0,
+        )
+        try:
+            conn.execute("PRAGMA query_only = ON")
+        except sqlite3.Error:
+            pass
+        cursor = conn.execute(
+            "SELECT id, api_content, timestamp FROM messages "
+            "WHERE session_id = ? AND api_content IS NOT NULL "
+            "AND api_content <> '' ORDER BY id DESC LIMIT ?",
+            (session_id, limit),
+        )
+        rows = cursor.fetchall()
+        cursor.close()
+    except (sqlite3.Error, OSError, ValueError) as exc:
+        result["reason"] = "state.db unreadable: %s" % exc
+        return result
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except sqlite3.Error:
+                pass
+
+    entries = []
+    for row in rows:
+        try:
+            row_id = row[0]
+            api_content = row[1]
+            timestamp = row[2]
+        except (IndexError, TypeError):
+            continue
+        if not isinstance(api_content, str) or not api_content.strip():
+            continue
+        recorded_at = _state_db_timestamp_to_iso(timestamp)
+
+        # Provider recall block: between <memory-context> and </memory-context>.
+        open_idx = api_content.find(_MEMORY_CONTEXT_OPEN)
+        if open_idx != -1:
+            close_idx = api_content.find(
+                _MEMORY_CONTEXT_CLOSE, open_idx + len(_MEMORY_CONTEXT_OPEN)
+            )
+            if close_idx != -1:
+                inner = api_content[
+                    open_idx + len(_MEMORY_CONTEXT_OPEN) : close_idx
+                ]
+                text = inner.strip()
+                count = sum(1 for line in inner.splitlines() if line.strip())
+                status = "empty" if not text else "injected"
+                entries.append(
+                    {
+                        "id": row_id,
+                        "recorded_at": recorded_at,
+                        "source": "provider recall",
+                        "bank": bank_id,
+                        "count": count,
+                        "injected_chars": len(text),
+                        "status": status,
+                        "text": text[:4000],
+                        "turn_id": "",
+                    }
+                )
+
+        # Plugin mental-models block: starts with the stable-context header.
+        plugin_idx = api_content.find(_PLUGIN_BLOCK_MARKER)
+        if plugin_idx != -1:
+            block = api_content[plugin_idx:].strip()
+            count = sum(
+                1
+                for line in block.splitlines()
+                if line.lstrip().startswith("## ")
+            )
+            text = block.strip()
+            if not text:
+                status = "empty"
+            elif "[... truncated" in text:
+                status = "truncated"
+            else:
+                status = "injected"
+            entries.append(
+                {
+                    "id": row_id,
+                    "recorded_at": recorded_at,
+                    "source": "plugin mental-models",
+                    "bank": bank_id,
+                    "count": count,
+                    "injected_chars": len(text),
+                    "status": status,
+                    "text": text[:4000],
+                    "turn_id": "",
+                }
+            )
+
+    result["entries"] = entries
+    result["source"] = "state.db"
+    return result
+
+
+# Aliases for compatibility with callers/tests that use other names.
+read_state_injections = read_state_db_injections
+read_injections_from_state_db = read_state_db_injections
+read_injections = read_state_db_injections
+read_state_db = read_state_db_injections
+parse_state_db_injections = read_state_db_injections
+state_db_injections = read_state_db_injections
+get_injections = read_state_db_injections
 
 
 def list_injection_sessions(hermes_home=None, limit=100) -> dict:

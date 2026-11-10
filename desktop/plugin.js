@@ -238,6 +238,34 @@ function useHistory(scope) {
   return query
 }
 
+function useInjections(scope) {
+  const revision = useValue(liveRevision)
+  const queryClient = useQueryClient()
+  const query = useQuery({
+    queryKey: [ID, 'injections', scope],
+    queryFn: () => {
+      if (!rest) {
+        return Promise.reject(new Error('The plugin API is not available yet.'))
+      }
+      return rest(
+        `/injections?session=${encodeURIComponent(scope)}&limit=200`,
+        { timeoutMs: 15000 }
+      )
+    },
+    enabled: Boolean(scope),
+    staleTime: 5000,
+    refetchInterval: 15000,
+    retry: 1
+  })
+
+  useEffect(() => {
+    if (!scope || revision === 0) return
+    void queryClient.invalidateQueries({ queryKey: [ID, 'injections', scope] })
+  }, [queryClient, revision, scope])
+
+  return query
+}
+
 function formatNumber(value) {
   const number = Number(value)
   return Number.isFinite(number) ? number.toLocaleString() : '0'
@@ -361,6 +389,54 @@ function normalizeProviderEntry(entry, bank) {
   }
 }
 
+function normalizeStateEntry(entry, bank) {
+  const source =
+    entry && entry.source === 'provider recall'
+      ? 'provider recall'
+      : 'plugin mental-models'
+  const text = entry && entry.text ? String(entry.text) : ''
+  const count =
+    entry && entry.count != null
+      ? entry.count
+      : source === 'plugin mental-models'
+        ? (text.match(/^## /gm) || []).length
+        : 0
+  return {
+    id: entry && entry.id,
+    recorded_at: (entry && entry.recorded_at) || new Date().toISOString(),
+    source,
+    bank: (entry && entry.bank) || bank || '—',
+    count,
+    injected_chars:
+      entry && entry.injected_chars != null ? entry.injected_chars : text.length,
+    status: (entry && entry.status) || 'injected',
+    truncated: (entry && entry.status) === 'truncated',
+    content: text,
+    text,
+    turn_id: (entry && entry.turn_id) || '',
+    model: '',
+    platform: '',
+    models: []
+  }
+}
+
+function dedupeInjectionEntries(entries) {
+  const seen = new Set()
+  const out = []
+  for (const entry of entries) {
+    if (!entry) continue
+    const date = new Date(entry.recorded_at)
+    const minute = Number.isNaN(date.getTime())
+      ? String(entry.recorded_at || '')
+      : date.toISOString().slice(0, 16)
+    const key = `${entry.source || ''}|${minute}`
+    if (seen.has(key)) continue
+    seen.add(key)
+    out.push(entry)
+  }
+  return out
+}
+
 function useHealthBank() {
   const query = useQuery({
     queryKey: [ID, 'health'],
@@ -441,34 +517,34 @@ function InjectionEntry({ entry, initiallyOpen }) {
                     children: `“${entry.user_preview}”`
                   })
                 : null,
-              entry.source === 'provider recall'
+              entry.source === 'provider recall' && !content
                 ? jsx('div', { style: styles.note, children: 'Provider recall captured from the live status line. Count and bank are shown above; the injected text is not available in this pane.' })
+                : content
+                ? jsx('div', {
+                    style: styles.content,
+                    children: raw
+                      ? jsx('pre', {
+                          style: styles.pre,
+                          children: content.length > 320 ? `${content.slice(0, 320)}…` : content
+                        })
+                      : jsx(Streamdown, {
+                          controls: false,
+                          mode: 'static',
+                          parseIncompleteMarkdown: false,
+                          children: content.length > 320 ? `${content.slice(0, 320)}…` : content
+                        })
+                  })
                 : entry.content_recorded
-                  ? content
                   ? jsx('div', {
-                      style: styles.content,
-                      children: raw
-                        ? jsx('pre', {
-                            style: styles.pre,
-                            children: content.length > 320 ? `${content.slice(0, 320)}…` : content
-                          })
-                        : jsx(Streamdown, {
-                            controls: false,
-                            mode: 'static',
-                            parseIncompleteMarkdown: false,
-                            children: content.length > 320 ? `${content.slice(0, 320)}…` : content
-                          })
-                    })
-                  : jsx('div', {
                       style: styles.note,
                       children:
                         'This audit entry has content recording enabled but no content payload.'
                     })
-                : jsx('div', {
-                    style: styles.note,
-                    children:
-                      'Content recording is off for this entry. Turn, model, and size metadata are still available.'
-                  }),
+                  : jsx('div', {
+                      style: styles.note,
+                      children:
+                        'Content recording is off for this entry. Turn, model, and size metadata are still available.'
+                    }),
               jsxs('div', {
                 style: styles.footer,
                 children: [
@@ -539,16 +615,23 @@ function MemoryTabTitle() {
 
 function PaneBody({ scope, history }) {
   const { data, error, isFetching, isLoading, refetch } = history
+  const injections = useInjections(scope)
   const healthBank = useHealthBank()
-  const bank = (data && data.bank) || healthBank
+  const bank = (data && data.bank) || (injections.data && injections.data.bank) || healthBank
   const pluginEntries = Array.isArray(data?.entries) ? data.entries : []
+  const stateEntries = Array.isArray(injections.data?.entries)
+    ? injections.data.entries
+    : []
+  const stateUnavailable =
+    injections.data && injections.data.source === 'unavailable'
   const providerEntries = useProviderEntries(scope).map(entry =>
     normalizeProviderEntry(entry, bank)
   )
-  const entries = [
+  const entries = dedupeInjectionEntries([
     ...pluginEntries.map(entry => normalizePluginEntry(entry, bank)),
+    ...stateEntries.map(entry => normalizeStateEntry(entry, bank)),
     ...providerEntries
-  ].sort((a, b) => {
+  ]).sort((a, b) => {
     const left = new Date(b.recorded_at).getTime()
     const right = new Date(a.recorded_at).getTime()
     return (Number.isFinite(left) ? left : 0) - (Number.isFinite(right) ? right : 0)
@@ -590,28 +673,44 @@ function PaneBody({ scope, history }) {
     })
   }
 
-  if (entries.length === 0) {
-    return jsx('div', {
-      style: styles.centered,
-      children: jsx(EmptyState, {
-        title: 'No injections recorded',
-        description:
-          'Memory appears here after the plugin adds Hindsight context to a turn. With the default first_turn mode that happens once per new chat.'
+  const unavailableNote = stateUnavailable
+    ? jsx('div', {
+        style: styles.note,
+        children: `Historical entries unavailable: ${injections.data.reason || 'state.db unreadable'}`
       })
+    : null
+
+  if (entries.length === 0) {
+    return jsxs('div', {
+      style: { flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column' },
+      children: [
+        unavailableNote,
+        jsx('div', {
+          style: styles.centered,
+          children: jsx(EmptyState, {
+            title: 'No injections recorded',
+            description:
+              'Memory appears here after the plugin adds Hindsight context to a turn. With the default first_turn mode that happens once per new chat.'
+          })
+        })
+      ]
     })
   }
 
   return jsx(ScrollArea, {
     style: { flex: 1, minHeight: 0 },
-    children: jsx('div', {
+    children: jsxs('div', {
       style: styles.list,
-      children: entries.map((entry, index) =>
-        jsx(
-          InjectionEntry,
-          { entry, initiallyOpen: index === 0 },
-          entry.id || `${entry.recorded_at || 'entry'}-${index}`
+      children: [
+        unavailableNote,
+        ...entries.map((entry, index) =>
+          jsx(
+            InjectionEntry,
+            { entry, initiallyOpen: index === 0 },
+            entry.id || `${entry.recorded_at || 'entry'}-${index}`
+          )
         )
-      )
+      ]
     })
   })
 }
