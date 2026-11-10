@@ -214,6 +214,29 @@ def history(
         ) from exc
 
 
+@router.get("/injections")
+def injections(
+    session: str = Query("", max_length=256),
+    session_id: str = Query("", max_length=256),
+    limit: int = Query(200, ge=1, le=1000),
+):
+    """Read injection history from Hermes' read-only ``state.db``.
+
+    Returns ``{session, entries, source, reason?}``. Never raises a 500:
+    an unreadable database yields ``source: "unavailable"``.
+    """
+    value = session or session_id
+    try:
+        return _core().read_state_db_injections(value, limit=limit)
+    except Exception as exc:
+        return {
+            "session": value,
+            "entries": [],
+            "source": "unavailable",
+            "reason": "state.db unreadable: %s" % exc,
+        }
+
+
 @router.get("/sessions")
 def sessions(limit: int = Query(100, ge=1, le=500)):
     """Return recent retained sessions, newest first."""

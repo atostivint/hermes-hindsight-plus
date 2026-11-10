@@ -13,6 +13,7 @@ import logging
 import os
 import pathlib
 import re
+import sqlite3
 import threading
 import time
 import urllib.error
@@ -1001,6 +1002,186 @@ def read_injection_history(session_id, hermes_home=None, limit=200) -> dict:
             if isinstance(entry, dict) and entry.get("bank"):
                 result["bank"] = str(entry.get("bank"))
                 break
+    return result
+
+
+def _state_db_timestamp_to_iso(value):
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return ""
+        try:
+            dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except (ValueError, TypeError):
+            return text
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.isoformat()
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return str(value)
+    if number > 1e12:
+        number = number / 1000.0
+    try:
+        return datetime.fromtimestamp(number, tz=timezone.utc).isoformat()
+    except (OSError, ValueError, OverflowError):
+        return str(value)
+
+
+_MEMORY_CONTEXT_OPEN = "<memory-context>"
+_MEMORY_CONTEXT_CLOSE = "</memory-context>"
+_PLUGIN_BLOCK_MARKER = "## Stable context (Hindsight"
+
+
+def read_state_db_injections(session_id, hermes_home=None, limit=200) -> dict:
+    """Read injection history from Hermes' read-only ``state.db``.
+
+    Returns ``{"session", "entries", "source", "reason"?}``. ``source`` is
+    ``"state.db"`` when the database could be read, ``"unavailable"`` otherwise.
+    Never writes to the database.
+    """
+    session_id = _clean_id(session_id)
+    limit = max(1, min(1000, _as_int(limit, 200)))
+    result = {"session": session_id, "entries": [], "source": "unavailable"}
+
+    home = pathlib.Path(hermes_home) if hermes_home else _hermes_home()
+    db_path = home / "state.db"
+
+    # Resolve the configured bank once; failures leave it empty rather than
+    # aborting the whole read.
+    bank_id = ""
+    try:
+        _api_url, resolved_bank, _api_key = resolve_endpoint(home)
+        bank_id = str(resolved_bank or "")
+    except Exception:
+        bank_id = ""
+
+    if not db_path.is_file():
+        result["reason"] = "state.db not found"
+        return result
+
+    conn = None
+    try:
+        conn = sqlite3.connect(
+            db_path.resolve().as_uri() + "?mode=ro",
+            uri=True,
+            timeout=2.0,
+        )
+        try:
+            conn.execute("PRAGMA query_only = ON")
+        except sqlite3.Error:
+            pass
+        cursor = conn.execute(
+            "SELECT id, api_content, timestamp FROM messages "
+            "WHERE session_id = ? AND api_content IS NOT NULL "
+            "AND api_content <> '' ORDER BY id DESC LIMIT ?",
+            (session_id, limit),
+        )
+        rows = cursor.fetchall()
+        cursor.close()
+    except (sqlite3.Error, OSError, ValueError) as exc:
+        result["reason"] = "state.db unreadable: %s" % exc
+        return result
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except sqlite3.Error:
+                pass
+
+    entries = []
+    for row in rows:
+        try:
+            row_id = row[0]
+            api_content = row[1]
+            timestamp = row[2]
+        except (IndexError, TypeError):
+            continue
+        if not isinstance(api_content, str) or not api_content.strip():
+            continue
+        recorded_at = _state_db_timestamp_to_iso(timestamp)
+
+        # Provider recall block: between <memory-context> and </memory-context>.
+        open_idx = api_content.find(_MEMORY_CONTEXT_OPEN)
+        if open_idx != -1:
+            close_idx = api_content.find(
+                _MEMORY_CONTEXT_CLOSE, open_idx + len(_MEMORY_CONTEXT_OPEN)
+            )
+            if close_idx != -1:
+                inner = api_content[
+                    open_idx + len(_MEMORY_CONTEXT_OPEN) : close_idx
+                ]
+                lines = inner.splitlines()
+                start = 0
+                while start < len(lines) and not lines[start].strip():
+                    start += 1
+                split_at = next(
+                    (i for i in range(start, len(lines)) if not lines[i].strip()),
+                    None,
+                )
+                if split_at is None:
+                    memory_lines = [
+                        line for line in lines[start:]
+                        if not line.lstrip().startswith("[System note")
+                    ]
+                else:
+                    memory_lines = lines[split_at + 1:]
+                text = "\n".join(memory_lines).strip()
+                bullet_lines = [
+                    line for line in memory_lines
+                    if line.lstrip().startswith(("-", "*"))
+                ]
+                count = len(bullet_lines) if bullet_lines else None
+                status = "empty" if not text else "injected"
+                entries.append(
+                    {
+                        "id": row_id,
+                        "recorded_at": recorded_at,
+                        "source": "provider recall",
+                        "bank": bank_id,
+                        "count": count,
+                        "injected_chars": len(text),
+                        "status": status,
+                        "text": text[:4000],
+                        "turn_id": "",
+                    }
+                )
+
+        # Plugin mental-models block: starts with the stable-context header.
+        plugin_idx = api_content.find(_PLUGIN_BLOCK_MARKER)
+        if plugin_idx != -1:
+            block = api_content[plugin_idx:].strip()
+            count = sum(
+                1
+                for line in block.splitlines()
+                if line.lstrip().startswith("## ")
+            )
+            text = block.strip()
+            if not text:
+                status = "empty"
+            elif "[... truncated" in text:
+                status = "truncated"
+            else:
+                status = "injected"
+            entries.append(
+                {
+                    "id": row_id,
+                    "recorded_at": recorded_at,
+                    "source": "plugin mental-models",
+                    "bank": bank_id,
+                    "count": count,
+                    "injected_chars": len(text),
+                    "status": status,
+                    "text": text[:4000],
+                    "turn_id": "",
+                }
+            )
+
+    result["entries"] = entries
+    result["source"] = "state.db"
     return result
 
 
