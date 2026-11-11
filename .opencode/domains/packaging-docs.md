@@ -55,5 +55,9 @@
 ## Open threads
 - Nothing is published to the plugin catalog, and nothing should be until the user asks.
 - `AGENTS.md` still says "97 tests" (100 since `tests/test_deploy_script.py`); needs a one-line fix.
-- `scripts/deploy.ps1` has never run outside `-DryRun`: the install/backup/copy branches were done by
-  hand on 2026-11-11, not by the script.
+- `scripts/deploy.ps1` ran for real twice on 2026-11-11 (v0.5.1, both hosts); the failure branches
+  (no `hermes`, missing source half, backup path taken, hash mismatch) are still happy-path only.
+- The ssh heredoc once shipped with a UTF-8 BOM, which silently disabled `set -euo pipefail` on the
+  remote side. Text piped to a native command goes through `$OutputEncoding`; it is now set to UTF-8
+  without preamble around the pipe, and the remote script opens with `:` so a stray BOM cannot weld
+  onto `set`.

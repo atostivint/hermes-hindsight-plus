@@ -26,7 +26,9 @@
   the host) and must reuse `core.py` instead of duplicating endpoint/auth code.
 - The Hindsight API key stays server-side: never sent to the browser, never written, printed or
   logged.
-- Banks are limited to `hermes`, `atlas`, `astro` (`BANKS`); anything else is a `400`.
+- Banks are limited to `hermes`, `atlas`, `astro` (`BANKS`); anything else is a `404`
+  (`check_bank` raises `ReviewError(404, ...)`; an earlier version of this note said 400 and was
+  wrong - measured 2026-11-11).
 - **No route calls `DELETE`.** The only writes are a soft `PATCH` (`state=invalidated` + reason, or
   `state=valid`, or a text rewrite on a memory fact) and one manual `POST .../memories` on an
   explicit click. Never on mental models, never automatic, never in batch.
@@ -62,3 +64,12 @@
 ## Open threads
 - The "Check with Hermes" flow starts a normal chat session; its verdict read-back was never
   confirmed against a real Desktop run.
+- HH-10/11 (2026-11-11, uncommitted): the list route now scans the whole bank (`MAX_SCAN`), ranks
+  globally, filters with `review_only`, and hides facts a local ledger marks "still true"
+  (`review-decisions.json` in the plugin data dir, `OK_TTL_DAYS = 90`, `MAX_DECISIONS = 5000`).
+  `to_review` is the queue size after the ledger; `matched` is the post-filter count, not a `q`
+  match count. `offset` is a best-effort cursor, not a snapshot.
+- No real bank has ever been scanned: the 10-call window, its latency and the `truncated` boundary
+  are proven against stubs only.
+- The ledger lock is intra-process (`threading.Lock`); two Hermes processes writing the same file
+  can lose one write.
