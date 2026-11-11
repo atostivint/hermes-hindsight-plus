@@ -27,6 +27,11 @@ never updates an existing model.
   (`state=invalidated` + reason), restore (`state=valid`), or rewrite the text of a *memory
   fact*, in banks `hermes|atlas|astro` only. Never `DELETE`, never automatically (an agent
   verdict is advice, not an action), never on mental models, never from the hook.
+  **Named derogation — manual memory creation (Memory review page only):** the SOLE
+  additional write allowed is `POST /v1/default/banks/{bank}/memories`, triggered by an
+  explicit click on "Ajouter un souvenir" in the Memory review page. Never from
+  `pre_llm_call`, never automatic, never in batch, banks `hermes|atlas|astro` only.
+  `DELETE` is always forbidden, on every endpoint.
 - **Creation is bounded.** Only on `404`; one POST per missing model; default
   `trigger.refresh_cron = "0 3 * * *"`; creation happens in the `pre_llm_call` hook, never
   in `register()` (Hermes requires registration to be I/O-free). Invalid model ids are

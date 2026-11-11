@@ -22,12 +22,17 @@ CURATABLE_TYPES = ("world", "experience")
 MAX_PAGE = 200
 MAX_TEXT_CHARS = 4000
 MAX_REASON_CHARS = 500
+MAX_MEMORY_CONTENT = 2000
+MAX_MEMORY_CONTEXT = 500
+MAX_MEMORY_TAGS = 5
+MAX_TAG_LENGTH = 40
 AGE_SATURATION_DAYS = 365
 REASON_PREFIXES = ("superseded by ", "outdated: ")
 
 _ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 _SORTS = ("age", "volatile", "staleness")
 _STATES = ("valid", "invalidated")
+_TAG_RE = re.compile(r"^[a-z0-9-]{1,40}$")
 
 
 class ReviewError(Exception):
@@ -192,7 +197,7 @@ class ReviewClient:
     def _request(self, method, path, payload=None):
         if not self.api_url:
             raise ReviewError(503, "Hindsight API URL is not configured")
-        if method not in ("GET", "PATCH"):
+        if method not in ("GET", "PATCH", "POST"):
             raise ReviewError(500, "unsupported method")
         data = None
         if payload is not None:
@@ -307,6 +312,70 @@ def update(client, bank, memory_id, text):
     """Rewrite a fact's text only; its curation state is left untouched."""
     text = check_text(text)
     return _curate(client, bank, memory_id, {"text": text})
+
+
+def create_memory(client, bank, content, context=None, tags=None):
+    """Create one memory fact via POST /memories (async=False).
+
+    The only creation path allowed by the plugin: triggered by an explicit user
+    click in the Memory review page. Never called from pre_llm_call, never in a
+    batch, banks hermes|atlas|astro only.
+    """
+    check_bank(bank)
+    if not isinstance(content, str) or not content.strip():
+        raise ReviewError(400, "content must be a non-empty string")
+    content = content.strip()
+    if len(content) > MAX_MEMORY_CONTENT:
+        raise ReviewError(400, "content is too long")
+
+    if context is None:
+        context = ""
+    elif not isinstance(context, str):
+        raise ReviewError(400, "context must be a string")
+    context = context.strip()
+    if context and len(context) > MAX_MEMORY_CONTEXT:
+        raise ReviewError(400, "context is too long")
+
+    if tags is None:
+        tags = []
+    elif isinstance(tags, str):
+        tags = [t.strip() for t in tags.split(",")]
+    elif not isinstance(tags, list):
+        raise ReviewError(400, "tags must be a list")
+    tags = [t for t in tags if t != ""]
+    if len(tags) > MAX_MEMORY_TAGS:
+        raise ReviewError(400, "too many tags")
+    for tag in tags:
+        if not isinstance(tag, str) or not _TAG_RE.match(tag):
+            raise ReviewError(400, "invalid tag")
+
+    item = {"content": content}
+    if context:
+        item["context"] = context
+    if tags:
+        item["tags"] = tags
+
+    payload = {"items": [item], "async": False}
+    try:
+        resp = client._request("POST", f"{client._base(bank)}/memories", payload)
+    except ReviewError:
+        raise
+    except Exception as exc:
+        raise ReviewError(502, "Hindsight is unreachable") from exc
+
+    created_id = None
+    if isinstance(resp, dict):
+        for key in ("items", "memories", "results", "data"):
+            value = resp.get(key)
+            if isinstance(value, list) and value:
+                first = value[0]
+                if isinstance(first, dict):
+                    created_id = first.get("id") or first.get("memory_id")
+                break
+        if created_id is None:
+            created_id = resp.get("id") or resp.get("memory_id")
+
+    return {"created": {"id": created_id, "content": content}}
 
 
 DOCUMENT_REMOVAL_REASON = "removed in document editor"

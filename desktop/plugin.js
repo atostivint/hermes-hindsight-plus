@@ -16,6 +16,7 @@ import {
   CopyButton,
   EmptyState,
   ErrorState,
+  Input,
   Loader,
   PALETTE_AREA,
   PANES_AREA,
@@ -1025,6 +1026,10 @@ function MemoryReviewPage() {
   const [view, setView] = useState('list')
   const [docText, setDocText] = useState('')
   const [docBase, setDocBase] = useState([])
+  const [showAdd, setShowAdd] = useState(false)
+  const [newContent, setNewContent] = useState('')
+  const [newContext, setNewContext] = useState('')
+  const [newTags, setNewTags] = useState('')
   const queryClient = useQueryClient()
   const key = [ID, 'review', bank, state, offset]
 
@@ -1048,6 +1053,34 @@ function MemoryReviewPage() {
   const docItems = sortReview(Array.isArray(docQuery.data?.items) ? docQuery.data.items : [], sort)
   const picked = items.filter(i => selected[i.id])
   const refresh = () => void queryClient.invalidateQueries({ queryKey: [ID, 'review'] })
+
+  const submitAdd = async () => {
+    const content = newContent.trim()
+    if (!content) {
+      setNotice('Le contenu est requis.')
+      return
+    }
+    const tags = newTags.split(',').map(t => t.trim()).filter(Boolean)
+    setBusy(true)
+    setNotice('')
+    try {
+      await reviewPost(`/review/${bank}/memories`, {
+        content,
+        context: newContext.trim(),
+        tags
+      })
+      setNewContent('')
+      setNewContext('')
+      setNewTags('')
+      setShowAdd(false)
+      setNotice('Souvenir ajoute.')
+      refresh()
+    } catch (error) {
+      setNotice(`Ajout impossible : ${String(error && error.message ? error.message : error)}`)
+    } finally {
+      setBusy(false)
+    }
+  }
 
   useEffect(() => {
     if (view !== 'document') return
@@ -1306,6 +1339,11 @@ function MemoryReviewPage() {
             onClick: () => void runCheck(),
             children: `Check with Hermes (${picked.length})`
           }),
+          jsx(Button, {
+            type: 'button', size: 'xs', variant: 'secondary',
+            onClick: () => setShowAdd(v => !v),
+            children: 'Ajouter un souvenir'
+          }),
           check
             ? jsx(Button, { type: 'button', size: 'xs', variant: 'ghost', disabled: busy, onClick: () => void readVerdicts(), children: 'Read verdicts' })
             : null,
@@ -1322,6 +1360,23 @@ function MemoryReviewPage() {
             children: [
               jsx('span', { style: { flex: 1 }, children: notice || `Last change: ${last.kind} (${last.previous.id.slice(0, 8)})` }),
               last ? jsx(Button, { type: 'button', size: 'xs', variant: 'secondary', disabled: busy, onClick: () => void undo(), children: 'Undo' }) : null
+            ]
+          })
+        : null,
+      showAdd
+        ? jsxs('div', {
+            style: { ...styles.note, margin: '8px 12px 0', display: 'grid', gap: 8 },
+            children: [
+              jsx(Textarea, { style: rv.textarea, value: newContent, placeholder: 'Le fait a memoriser', onChange: e => setNewContent(e.target.value) }),
+              jsx(Input, { style: { ...rv.field, width: '100%', boxSizing: 'border-box' }, value: newContext, placeholder: 'Contexte (facultatif)', onChange: e => setNewContext(e.target.value) }),
+              jsx(Input, { style: { ...rv.field, width: '100%', boxSizing: 'border-box' }, value: newTags, placeholder: 'tags separes par des virgules', onChange: e => setNewTags(e.target.value) }),
+              jsxs('div', {
+                style: rv.actions,
+                children: [
+                  jsx(Button, { type: 'button', size: 'sm', variant: 'primary', disabled: busy || !newContent.trim(), onClick: () => void submitAdd(), children: 'Ajouter' }),
+                  jsx(Button, { type: 'button', size: 'sm', variant: 'ghost', disabled: busy, onClick: () => setShowAdd(false), children: 'Annuler' })
+                ]
+              })
             ]
           })
         : null,

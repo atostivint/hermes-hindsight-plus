@@ -383,9 +383,10 @@ def test_unreachable_hindsight_is_502_and_unconfigured_is_503(review):
 
 def test_client_never_issues_delete_or_put(review):
     source = (ROOT / "review.py").read_text("utf-8")
-    assert '"DELETE"' not in source.replace('method not in ("GET", "PATCH")', "")
+    assert '"DELETE"' not in source
     assert '"PUT"' not in source
-    assert '"POST"' not in source
+    # POST is now allowed, but only for /memories creation.
+    assert '"POST"' in source
 
 
 # --- check with Hermes ---------------------------------------------------------

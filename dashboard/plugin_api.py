@@ -148,6 +148,21 @@ def review_update(bank: str, memory_id: str, payload: Annotated[dict, Body()]):
     )
 
 
+@router.post("/review/{bank}/memories")
+def review_create(bank: str, payload: Annotated[dict, Body()] = None):
+    """Create one memory fact via POST /memories (async=False). Returns ``created``."""
+    data = payload or {}
+    return _review_call(
+        lambda: _review().create_memory(
+            _review_client(),
+            bank,
+            data.get("content"),
+            data.get("context"),
+            data.get("tags"),
+        )
+    )
+
+
 @router.post("/review/check-prompt")
 def review_check_prompt(payload: Annotated[dict, Body()]):
     """Build the verification prompt for 1..10 selected facts."""
