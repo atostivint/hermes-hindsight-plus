@@ -32,7 +32,7 @@ import {
   useValue
 } from '@hermes/plugin-sdk'
 import { jsx, jsxs } from 'react/jsx-runtime'
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 
 const ID = 'hermes-hindsight-plus'
 const EVENT = `plugin.${ID}.injection.recorded`
@@ -818,6 +818,50 @@ const rv = {
   },
   text: { fontSize: 12, lineHeight: 1.5, overflowWrap: 'anywhere' },
   actions: { display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' },
+  // Card triage: one fact at a time, centred and readable.
+  deck: {
+    display: 'grid',
+    gap: 10,
+    width: '100%',
+    maxWidth: 720,
+    boxSizing: 'border-box',
+    margin: '0 auto',
+    padding: 12
+  },
+  progress: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: 6,
+    flexWrap: 'wrap',
+    fontSize: 10,
+    color: 'var(--ui-text-tertiary)'
+  },
+  deckCard: {
+    display: 'grid',
+    gap: 10,
+    padding: '14px 16px',
+    border: '1px solid var(--ui-stroke-secondary)',
+    borderRadius: 8,
+    background: 'var(--ui-surface-background, var(--ui-bg-secondary))'
+  },
+  deckText: {
+    fontSize: 14,
+    lineHeight: 1.5,
+    color: 'var(--ui-text-primary)',
+    overflowWrap: 'anywhere'
+  },
+  deckMeta: {
+    fontSize: 10,
+    color: 'var(--ui-text-tertiary)',
+    overflowWrap: 'anywhere'
+  },
+  deckActions: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: 8,
+    flexWrap: 'wrap',
+    paddingTop: 2
+  },
   textarea: {
     width: '100%',
     minHeight: 90,
@@ -857,6 +901,57 @@ function collectStrings(value, out = []) {
   return out
 }
 
+// The provenance line under a fact, shared by the list row and the card deck.
+function reviewProvenance(item) {
+  return item.date
+    ? `${item.date}${item.context ? ' · ' + item.context : ''}`
+    : (item.context ? item.context : 'source inconnue')
+}
+
+// Volatile hits live in the badge's title only; shared with the card deck.
+function reviewVolatileTitle(item) {
+  const hits =
+    Array.isArray(item.volatile_hits) && item.volatile_hits.length
+      ? item.volatile_hits.join(', ')
+      : 'none'
+  return `volatile: ${hits}`
+}
+
+// The staleness badges, shared by the list row and the card deck. `extra` is the
+// row's per-fact actions (or its "derived" badge); the deck passes nothing.
+function ReviewBadges({ item, verdict, extra }) {
+  const invalid = item.state === 'invalidated'
+  return jsxs('div', {
+    style: rv.actions,
+    children: [
+      jsx(Badge, {
+        size: 'xs',
+        variant: 'muted',
+        title: item.date,
+        children: item.age_days == null ? 'age unknown' : `${item.age_days} d (${pct(item.age_score)})`
+      }),
+      jsx(Badge, {
+        size: 'xs',
+        variant: item.volatile_score > 0 ? 'warn' : 'muted',
+        title: reviewVolatileTitle(item),
+        children: `volatile ${pct(item.volatile_score)}`
+      }),
+      invalid
+        ? jsx(Badge, { size: 'xs', variant: 'warn', title: item.invalidation_reason || '', children: 'revoked' })
+        : null,
+      verdict
+        ? jsx(Badge, {
+            size: 'xs',
+            variant: VERDICT_VARIANT[verdict.verdict] || 'muted',
+            title: verdict.evidence || '',
+            children: verdict.verdict
+          })
+        : null,
+      extra || null
+    ]
+  })
+}
+
 function ReviewRow({
   item,
   checked,
@@ -870,11 +965,7 @@ function ReviewRow({
   onCancelEdit,
   onStartEdit
 }) {
-  const volatile = item.volatile_hits.length ? item.volatile_hits.join(', ') : 'none'
   const invalid = item.state === 'invalidated'
-  const provenance = item.date
-    ? `${item.date}${item.context ? ' · ' + item.context : ''}`
-    : (item.context ? item.context : 'source inconnue')
   return jsxs('section', {
     style: { ...rv.row, opacity: invalid ? 0.7 : 1 },
     children: [
@@ -924,47 +1015,70 @@ function ReviewRow({
               }),
           jsx('div', {
             style: { fontSize: 10, color: 'var(--ui-text-tertiary)', overflowWrap: 'anywhere' },
-            children: provenance
+            children: reviewProvenance(item)
           }),
-          jsxs('div', {
-            style: rv.actions,
-            children: [
-              jsx(Badge, {
-                size: 'xs',
-                variant: 'muted',
-                title: item.date,
-                children: item.age_days == null ? 'age unknown' : `${item.age_days} d (${pct(item.age_score)})`
-              }),
-              jsx(Badge, {
-                size: 'xs',
-                variant: item.volatile_score > 0 ? 'warn' : 'muted',
-                title: `volatile: ${volatile}`,
-                children: `volatile ${pct(item.volatile_score)}`
-              }),
-              invalid
-                ? jsx(Badge, { size: 'xs', variant: 'warn', title: item.invalidation_reason || '', children: 'revoked' })
-                : null,
-              verdict
-                ? jsx(Badge, {
-                    size: 'xs',
-                    variant: VERDICT_VARIANT[verdict.verdict] || 'muted',
-                    title: verdict.evidence || '',
-                    children: verdict.verdict
-                  })
-                : null,
-              item.curatable
-                ? jsxs('span', {
-                    style: { ...rv.actions, marginLeft: 'auto' },
-                    children: [
-                      invalid
-                        ? jsx(Button, { type: 'button', size: 'xs', variant: 'secondary', onClick: () => onAction('restore', item), children: 'Restore' })
-                        : jsx(Button, { type: 'button', size: 'xs', variant: 'secondary', onClick: () => onAction('revoke', item), children: 'Revoke' })
-                    ]
-                  })
-                : jsx(Badge, { size: 'xs', variant: 'muted', children: 'derived' })
-            ]
+          jsx(ReviewBadges, {
+            item,
+            verdict,
+            extra: item.curatable
+              ? jsxs('span', {
+                  style: { ...rv.actions, marginLeft: 'auto' },
+                  children: [
+                    invalid
+                      ? jsx(Button, { type: 'button', size: 'xs', variant: 'secondary', onClick: () => onAction('restore', item), children: 'Restore' })
+                      : jsx(Button, { type: 'button', size: 'xs', variant: 'secondary', onClick: () => onAction('revoke', item), children: 'Revoke' })
+                  ]
+                })
+              : jsx(Badge, { size: 'xs', variant: 'muted', children: 'derived' })
           })
         ]
+      })
+    ]
+  })
+}
+
+// Card triage: one fact, its provenance and badges, and the three verdicts. The
+// buttons mirror the keyboard shortcuts; the write itself lives in the page.
+// "Correct" only writes the local ledger, so it stays available on any fact;
+// only the revoke of "Faux" needs a curatable, valid fact.
+function ReviewCard({ item, verdict, busy, onVerdict }) {
+  const invalid = item.state === 'invalidated'
+  const cannotRevoke = !item.curatable || invalid
+  return jsxs('section', {
+    style: rv.deckCard,
+    children: [
+      jsx('div', { style: rv.deckText, children: item.text }),
+      jsx('div', { style: rv.deckMeta, children: reviewProvenance(item) }),
+      jsx(ReviewBadges, { item, verdict }),
+      jsxs('div', {
+        style: rv.deckActions,
+        children: [
+          jsx(Button, {
+            type: 'button', size: 'sm', variant: 'primary',
+            disabled: busy,
+            title: 'Marquer comme toujours vrai (aucune écriture dans Hindsight)',
+            onClick: () => onVerdict('still true'),
+            children: 'Correct'
+          }),
+          jsx(Button, {
+            type: 'button', size: 'sm', variant: 'secondary',
+            disabled: busy || cannotRevoke,
+            title: cannotRevoke ? 'Fait dérivé ou déjà révoqué : non révocable' : 'Marquer comme faux et révoquer ce fait',
+            onClick: () => onVerdict('outdated'),
+            children: 'Faux'
+          }),
+          jsx(Button, {
+            type: 'button', size: 'sm', variant: 'ghost',
+            disabled: busy,
+            title: 'Passer cette carte sans rien changer',
+            onClick: () => onVerdict('cannot tell'),
+            children: 'Je ne sais pas'
+          })
+        ]
+      }),
+      jsx('div', {
+        style: rv.deckMeta,
+        children: 'Raccourcis : → correct, ← faux, espace je ne sais pas'
       })
     ]
   })
@@ -1106,22 +1220,132 @@ function MemoryReviewPage() {
   const [newContext, setNewContext] = useState('')
   const [newTags, setNewTags] = useState('')
   const [search, setSearch] = useState('')
+  const [debouncedSearch, setDebouncedSearch] = useState('')
   const [editingId, setEditingId] = useState(null)
   const [editText, setEditText] = useState('')
+  const [view, setView] = useState('list')
+  // Session-local bookkeeping for the card deck: ids that already left it (any
+  // verdict), and whether the deck was refetched once after running out.
+  const [skipped, setSkipped] = useState({})
+  const [deckDone, setDeckDone] = useState(false)
+  // In-flight guard for the deck: `busy` is read from this render's closure, so
+  // two events before the re-render would both pass it. The ref flips synchronously.
+  const decidingRef = useRef(false)
   const queryClient = useQueryClient()
-  const key = [ID, 'review', bank, state, offset]
+
+  const cards = view === 'cards'
+  const searchTerm = debouncedSearch
+  const key = [ID, 'review', bank, state, offset, view, searchTerm]
+
+  // A search runs over the whole bank server-side, so it must not fire on every
+  // keystroke: the query key only sees the debounced value.
+  useEffect(() => {
+    const timer = setTimeout(() => setDebouncedSearch(search.trim()), 300)
+    return () => clearTimeout(timer)
+  }, [search])
 
   const query = useQuery({
     queryKey: key,
     queryFn: () =>
-      reviewCall(`/review/${bank}/memories?limit=100&offset=${offset}&state=${state}&sort=staleness`),
+      reviewCall(
+        cards
+          ? `/review/${bank}/memories?limit=100&offset=0&state=valid&sort=staleness&review_only=1&q=${encodeURIComponent(searchTerm)}`
+          : `/review/${bank}/memories?limit=100&offset=${offset}&state=${state}&sort=staleness&review_only=0&q=${encodeURIComponent(searchTerm)}`
+      ),
     staleTime: 10000,
     retry: 1
   })
 
   const items = sortReview(Array.isArray(query.data?.items) ? query.data.items : [], sort)
+  // The deck keeps the server's order (the queue is sorted by staleness there).
+  const deckItems = cards && Array.isArray(query.data?.items) ? query.data.items : []
+  // Session-local cursor: the first card the user has not decided on yet.
+  const deckRemaining = deckItems.filter(i => !skipped[i.id])
+  const card = deckRemaining[0] || null
   const picked = items.filter(i => selected[i.id])
   const refresh = () => void queryClient.invalidateQueries({ queryKey: [ID, 'review'] })
+
+  // One verdict from the card deck: record the decision in the local ledger
+  // first (no Hindsight write), then revoke for `outdated` only and drop the
+  // card so the deck advances. An already-invalidated fact counts as revoked;
+  // any other failure keeps the card so the user can retry it.
+  const decide = async verdict => {
+    if (decidingRef.current || !card) return
+    if (verdict === 'outdated' && (!card.curatable || card.state === 'invalidated')) {
+      setNotice('Fait dérivé ou déjà révoqué : il ne peut pas être marqué faux.')
+      return
+    }
+    decidingRef.current = true
+    setBusy(true)
+    setNotice('')
+    try {
+      await reviewPost(`/review/${bank}/decisions`, {
+        id: card.id,
+        verdict,
+        hash: card.text_hash
+      })
+      if (verdict === 'outdated') {
+        try {
+          await reviewPost(`/review/${bank}/memories/${encodeURIComponent(card.id)}/revoke`, {
+            reason: 'outdated: marked in card review'
+          })
+        } catch (error) {
+          const message = String((error && error.message) || error)
+          if (!message.includes('not valid')) throw error
+        }
+      }
+      setSkipped(prev => ({ ...prev, [card.id]: true }))
+    } catch (error) {
+      setNotice('Enregistrement impossible : ' + String((error && error.message) || error))
+    } finally {
+      decidingRef.current = false
+      setBusy(false)
+    }
+  }
+
+  // A new bank, view or search term starts a fresh deck. `state` and `sort` are
+  // deliberately absent: both selects are list-only and the deck URL hardcodes
+  // them, so they can only clear `skipped` without changing the query.
+  useEffect(() => {
+    setSkipped({})
+    setDeckDone(false)
+  }, [bank, view, searchTerm])
+
+  // Deck exhausted: refetch once so the facts just decided leave and the next
+  // batch of the queue loads.
+  useEffect(() => {
+    if (!cards || !query.data) return
+    if (card || deckDone || query.isFetching) return
+    setDeckDone(true)
+    refresh()
+  }, [cards, card, deckDone, query.isFetching, query.data])
+
+  // Keyboard triage: arrows and space mirror the card's buttons. Auto-repeat is
+  // filtered (holding ArrowRight would otherwise walk the whole queue) and the
+  // focused control keeps its own keys: Space belongs to a focused button.
+  useEffect(() => {
+    if (!cards || !card || busy) return undefined
+    const onKeyDown = event => {
+      if (event.repeat) return
+      const target = event.target
+      if (
+        target &&
+        target.closest &&
+        target.closest('input, textarea, select, button, a, [role="button"], [contenteditable]')
+      ) {
+        return
+      }
+      if (document.querySelector('[role="dialog"]')) return
+      const key = event.key
+      if (key === 'ArrowRight') decide('still true')
+      else if (key === 'ArrowLeft') decide('outdated')
+      else if (key === ' ' || key === 'Spacebar') decide('cannot tell')
+      else return
+      event.preventDefault()
+    }
+    document.addEventListener('keydown', onKeyDown)
+    return () => document.removeEventListener('keydown', onKeyDown)
+  }, [cards, card, busy])
 
   const submitAdd = async () => {
     const content = newContent.trim()
@@ -1265,18 +1489,18 @@ function MemoryReviewPage() {
       children: options.map(([v, label]) => jsx('option', { value: v, children: label }, v))
     })
 
-  const q = search.trim().toLowerCase()
-  const filtered = q
-    ? items.filter(i =>
-        String(i.text || '').toLowerCase().includes(q) ||
-        String(i.context || '').toLowerCase().includes(q))
-    : items
-  const stale = filtered.filter(i => (i.staleness || 0) > 0).length
-  const total = formatNumber(query.data?.total ?? items.length)
+  // List mode scans the same bounded window as the deck: say so once, in the
+  // same words, instead of letting an empty page look like an empty bank.
+  const truncatedNote = query.data?.truncated
+    ? jsx('div', {
+        style: rv.progress,
+        children: 'La banque est plus grande que la fenêtre analysée : certains souvenirs ne sont pas dans cette file.'
+      })
+    : null
 
   // group by theme
   const groups = new Map()
-  for (const it of filtered) {
+  for (const it of items) {
     const t = themeOf(it)
     if (!groups.has(t)) groups.set(t, [])
     groups.get(t).push(it)
@@ -1304,19 +1528,31 @@ function MemoryReviewPage() {
         style: rv.bar,
         children: [
           jsx('div', { style: { ...styles.title, flex: 1 }, children: 'Memory review' }),
+          jsx(Button, {
+            type: 'button', size: 'xs', variant: cards ? 'primary' : 'secondary',
+            title: cards ? 'Revenir à la liste' : 'Trier les souvenirs carte par carte',
+            disabled: !cards && (query.data?.to_review || 0) === 0,
+            onClick: () => { setView(cards ? 'list' : 'cards'); setOffset(0) },
+            children: cards ? 'Liste' : 'Cartes'
+          }),
           select(bank, v => { setBank(v); setOffset(0); setSelected({}) }, REVIEW_BANKS.map(b => [b, b])),
-          select(state, v => { setState(v); setOffset(0) }, [['valid', 'valid'], ['invalidated', 'revoked']]),
-          select(sort, setSort, [['staleness', 'Sort: staleness'], ['age', 'Sort: age'], ['volatile', 'Sort: volatile']]),
+          // `state` and `sort` are list-only: the deck's URL hardcodes both.
+          cards
+            ? null
+            : select(state, v => { setState(v); setOffset(0) }, [['valid', 'valid'], ['invalidated', 'revoked']]),
+          cards
+            ? null
+            : select(sort, setSort, [['staleness', 'Sort: staleness'], ['age', 'Sort: age'], ['volatile', 'Sort: volatile']]),
           jsx(Input, {
             style: { ...rv.field, minWidth: 160, flex: 1 },
             value: search,
-            placeholder: 'Rechercher (texte, contexte)',
+            placeholder: 'Rechercher dans la banque',
             onChange: e => setSearch(e.target.value)
           }),
           jsx('span', {
             style: styles.footerText,
-            title: 'Le compte "à revoir" porte sur les souvenirs affichés (score de staleness supérieur à zéro), pas sur toute la banque.',
-            children: `${filtered.length} / ${total} souvenirs · ${stale} à revoir sur cette page`
+            title: 'Faits de la page affichée, faits analysés dans la fenêtre de scan, et file "à revoir" de toute la banque.',
+            children: `${items.length} affichés · ${query.data?.matched ?? 0} analysés · ${query.data?.to_review ?? 0} à revoir`
           }),
           jsx(Button, {
             type: 'button', size: 'xs', variant: 'secondary',
@@ -1386,13 +1622,66 @@ function MemoryReviewPage() {
                   children: jsx(Button, { type: 'button', variant: 'secondary', size: 'sm', onClick: () => void query.refetch(), children: 'Try again' })
                 })
               })
-            : filtered.length === 0
-              ? jsx('div', { style: styles.centered, children: jsx(EmptyState, { title: 'No facts here', description: 'Nothing to review in this bank and state.' }) })
+            : cards
+              ? jsx(ScrollArea, {
+                  style: { flex: 1, minHeight: 0 },
+                  children: jsxs('div', {
+                    style: rv.deck,
+                    children: [
+                      card
+                        ? jsx('div', {
+                            style: rv.progress,
+                            children: `carte ${deckItems.indexOf(card) + 1} / ${deckItems.length}`
+                          })
+                        : null,
+                      query.data?.truncated
+                        ? jsx('div', {
+                            style: rv.progress,
+                            children: 'La banque est plus grande que la fenêtre analysée : certains souvenirs ne sont pas dans cette file.'
+                          })
+                        : null,
+                      card
+                        ? jsx(ReviewCard, { item: card, verdict: verdicts[card.id], busy, onVerdict: decide })
+                        : (query.data?.to_review ?? 0) === 0
+                          ? jsx(EmptyState, {
+                              title: 'Rien à revoir',
+                              description: 'Aucun souvenir de cette banque ne demande de revue.'
+                            })
+                          : jsxs('div', {
+                              style: { ...styles.centered, gap: 10, padding: 16 },
+                              children: [
+                                jsx(EmptyState, {
+                                  title: 'File terminée',
+                                  description: 'Toutes les cartes de cette file ont reçu un verdict.'
+                                }),
+                                jsx(Button, {
+                                  type: 'button', size: 'sm', variant: 'secondary',
+                                  disabled: query.isFetching, onClick: refresh, children: 'Rafraîchir'
+                                })
+                              ]
+                            })
+                    ]
+                  })
+                })
+              : items.length === 0
+              ? jsxs('div', {
+                  style: { ...styles.centered, gap: 10 },
+                  children: [
+                    truncatedNote,
+                    jsx(EmptyState, { title: 'No facts here', description: 'Nothing to review in this bank and state.' }),
+                    // Past the scan window the page is empty but the offset is not 0:
+                    // keep a way back instead of a dead end.
+                    offset > 0
+                      ? jsx(Button, { type: 'button', size: 'xs', variant: 'ghost', onClick: () => setOffset(Math.max(0, offset - 100)), children: 'Newer' })
+                      : null
+                  ]
+                })
               : jsx(ScrollArea, {
                   style: { flex: 1, minHeight: 0 },
                   children: jsxs('div', {
                     style: styles.list,
                     children: [
+                      truncatedNote,
                       ...themeKeys.map(theme =>
                         jsxs('div', {
                           key: theme,
@@ -1422,7 +1711,14 @@ function MemoryReviewPage() {
                         children: [
                           jsx(Button, { type: 'button', size: 'xs', variant: 'ghost', disabled: offset === 0, onClick: () => setOffset(Math.max(0, offset - 100)), children: 'Newer' }),
                           jsx('span', { style: styles.footerText, children: `${offset + 1}-${offset + items.length} of ${formatNumber(query.data?.total)}` }),
-                          jsx(Button, { type: 'button', size: 'xs', variant: 'ghost', disabled: items.length < 100, onClick: () => setOffset(offset + 100), children: 'Older' })
+                          jsx(Button, {
+                            type: 'button', size: 'xs', variant: 'ghost',
+                            // Stop at the end of the page slice or of the scored set: past
+                            // the scan window the backend returns an empty page.
+                            disabled: items.length < 100 || offset + 100 >= (query.data?.matched ?? 0),
+                            onClick: () => setOffset(offset + 100),
+                            children: 'Older'
+                          })
                         ]
                       })
                     ]
