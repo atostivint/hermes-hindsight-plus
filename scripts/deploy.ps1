@@ -2,7 +2,8 @@
 # documented acceptance command (`powershell -NoProfile -File scripts/deploy.ps1 ...`) works.
 # 5.1 rules this file obeys: never redirect a native command's stderr (merging or nulling
 # stderr throws under $ErrorActionPreference='Stop'), and never emit non-ASCII into the ssh
-# pipe (5.1 encodes piped text as us-ascii, so the remote script below stays pure ASCII).
+# pipe (the remote script below stays pure ASCII). Text piped to a native command is encoded
+# with $OutputEncoding, which may carry a UTF-8 preamble: see Deploy-Oracle.
 <#
 .SYNOPSIS
     Deploy a new version of the hermes-hindsight-plus plugin to the real hosts.
@@ -190,9 +191,18 @@ function Deploy-Windows {
 # ---------------------------------------------------------------- oracle target
 
 # One ssh invocation: this whole script goes to `bash -s` on stdin, so no quoting hell.
-# It must stay ASCII-only: Windows PowerShell 5.1 encodes piped text as us-ascii.
+# It must stay ASCII-only so that every possible $OutputEncoding encodes it faithfully.
+#
+# Line 1 is `:` and not `set`, on purpose. A UTF-8 BOM on stdin welds onto the first token,
+# so a BOM would turn `set -euo pipefail` into `bomset: command not found`, that command would
+# not run, and the whole remote half would proceed with no -e, -u or pipefail (measured
+# 2026-11-11). With `:` first, the worst case is a failed no-op whose diagnostic the remote
+# shell (this is bash, not PowerShell, so the no-piped-stderr rule does not apply) discards,
+# and `set -euo pipefail` still runs. Measured under bash 5.3: BOM + `set -euo pipefail`
+# prints "command not found", does not set the guard, and lets a later `false` through;
+# BOM + this line prints nothing and stops at the `false`.
 $OracleScript = @'
-set -euo pipefail
+: 2>/dev/null; set -euo pipefail
 export PATH="$HOME/.local/bin:/usr/local/bin:$PATH"
 
 HERMES_BIN="$(command -v hermes || true)"
@@ -273,9 +283,20 @@ function Deploy-Oracle {
         return
     }
     Write-Host "  ssh $OracleHost   (one invocation, script on stdin)"
-    $OracleScript | & ssh $OracleHost 'bash -s'
-    if ($LASTEXITCODE -ne 0) {
-        Write-Host "  error: remote deploy failed (ssh exit $LASTEXITCODE)" -ForegroundColor Red
+    # Text piped to a native command is encoded with $OutputEncoding; UTF-8 encodings built
+    # with the BOM flag prepend a preamble, and bash then reads line 1 as one word with the
+    # BOM glued to it. Pipe UTF-8 with no preamble, and restore the previous value afterwards
+    # (this assignment is function-scoped, so the caller's value is never touched).
+    $prevOutputEncoding = $OutputEncoding
+    $OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+    try {
+        $OracleScript | & ssh $OracleHost 'bash -s'
+        $sshExit = $LASTEXITCODE
+    } finally {
+        $OutputEncoding = $prevOutputEncoding
+    }
+    if ($sshExit -ne 0) {
+        Write-Host "  error: remote deploy failed (ssh exit $sshExit)" -ForegroundColor Red
         exit 1
     }
     Write-Host '  ok: oracle deployed' -ForegroundColor Green
