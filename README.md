@@ -9,7 +9,7 @@ Inject [Hindsight](https://github.com/vectorize-io/hindsight) **mental models** 
 first turn of every Hermes Agent conversation, so each session starts with stable,
 cron-refreshed context instead of a hand-maintained `MEMORY.md` / `USER.md`.
 
-Version 0.5.1 — MIT.
+Version 0.6.0 — MIT.
 
 ## Why mental models instead of MEMORY.md / USER.md
 
@@ -91,6 +91,26 @@ oldest-first: per-session excess first, then older sessions, then the oldest tot
 
 Injection content is appended to the model's user message, so it still is not an inline chat
 card; the pane is the sanctioned way to inspect exactly what the plugin added.
+
+### Memory review
+
+The opt-in **Memory review** page triages the bank's facts. The list is scored and sorted
+server-side across the whole bank (up to 2,000 facts, at most 40 upstream calls) and reports
+`truncated` when the bank is larger; the "à revoir seulement" view keeps only the facts that are
+stale or volatile. Each fact carries an age score, a volatility score, and the terms that
+tripped it.
+
+**Card mode** shows one fact at a time with three answers, also on ← / → / Space: **Correct**,
+**Faux**, **Je ne sais pas**. Faux soft-invalidates the fact upstream (`PATCH`
+`state=invalidated`, with a recorded reason): it stays in Hindsight for audit but is excluded
+from recall. Correct and Je ne sais pas write nothing to Hindsight.
+
+Answers are recorded in a local ledger,
+`$HERMES_HOME/plugin-data/hermes-hindsight-plus/review-decisions.json` — the verdict, its
+timestamp, and a hash of the fact's text, never the text itself and never the API key.
+"Correct" hides the fact from the review queue for 90 days, or until its text changes. Nothing
+is ever deleted, and agent verdicts (**Check with Hermes (n)**) remain advice you apply
+yourself.
 
 ## Creating / refreshing the mental model in Hindsight
 
