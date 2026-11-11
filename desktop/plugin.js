@@ -23,7 +23,6 @@ import {
   ROUTES_AREA,
   SIDEBAR_NAV_AREA,
   ScrollArea,
-  SegmentedControl,
   Streamdown,
   Textarea,
   atom,
@@ -1061,17 +1060,31 @@ async function startHermesCheck(bank, facts) {
   }
 }
 
+const THEME_KEYS = [
+  ['sante', 'Sante', ['sante', 'medecin', 'sommeil', 'traitement']],
+  ['famille', 'Famille', ['ex-femme', 'parents', 'grand-mere', 'divorce']],
+  ['argent', 'Argent', ['ynab', 'budget', 'salaire', 'banque', 'impots']],
+  ['emploi', 'Emploi', ['emploi', 'cv', 'linkedin', 'entretien', 'recruteur', 'atlas']],
+  ['infra', 'Infra', ['homelab', 'proxmox', 'oracle', 'zenith', 'zenon', 'kubernetes', 'ansible', 'tailscale', 'docker', 'dns', 'hermes', 'gateway']],
+  ['projets', 'Projets', ['projet', 'plugin', 'hindsight', 'kanban', 'paseo', 'tronic', 'busybar', 'memoire']],
+  ['preferences', 'Preferences', ['prefere', 'preference', 'aime', 'style', 'ton', 'langue', 'francais', 'falc']]
+]
+const ALLOWED_TAGS = new Set(['identite', 'travail', 'sante', 'famille', 'argent', 'preferences', 'projets', 'infra'])
+
 function themeOf(item) {
   const tags = Array.isArray(item && item.tags) ? item.tags : []
-  if (tags.length) {
-    const t = String(tags[0] || '').trim()
-    if (t) return t
+  for (const t of tags) {
+    const tag = String(t || '').trim().toLowerCase()
+    if (ALLOWED_TAGS.has(tag)) {
+      return tag.charAt(0).toUpperCase() + tag.slice(1)
+    }
   }
-  const ctx = String((item && item.context) || '').trim()
-  if (ctx) {
-    const first = ctx.split(/\s+/)[0].replace(/[.,;:!?()[\]{}"']/g, '')
-    if (first) return first
+  const haystack = (String((item && item.text) || '') + ' ' + String((item && item.context) || '')).toLowerCase()
+  for (const [, label, words] of THEME_KEYS) {
+    if (words.some(w => haystack.includes(w))) return label
   }
+  if (haystack.includes('travail')) return 'Emploi'
+  if (haystack.includes('identite')) return 'Identite'
   return 'General'
 }
 
@@ -1267,7 +1280,17 @@ function MemoryReviewPage() {
     if (!groups.has(t)) groups.set(t, [])
     groups.get(t).push(it)
   }
-  const themeKeys = [...groups.keys()].sort((a, b) => {
+  let finalGroups = groups
+  if (groups.size > 8) {
+    finalGroups = new Map()
+    const autres = []
+    for (const [t, its] of groups) {
+      if (t !== 'General' && its.length <= 1) autres.push(...its)
+      else finalGroups.set(t, its)
+    }
+    if (autres.length) finalGroups.set('Autres', autres)
+  }
+  const themeKeys = [...finalGroups.keys()].sort((a, b) => {
     if (a === 'General') return 1
     if (b === 'General') return -1
     return String(a).localeCompare(String(b))
@@ -1372,9 +1395,9 @@ function MemoryReviewPage() {
                           children: [
                             jsxs('div', {
                               style: { fontSize: 12, fontWeight: 600, color: 'var(--ui-text-secondary)', padding: '4px 2px' },
-                              children: [theme, jsx('span', { style: { marginLeft: 6, fontSize: 10, color: 'var(--ui-text-tertiary)' }, children: `(${groups.get(theme).length})` })]
+                              children: [theme, jsx('span', { style: { marginLeft: 6, fontSize: 10, color: 'var(--ui-text-tertiary)' }, children: `(${finalGroups.get(theme).length})` })]
                             }),
-                            ...groups.get(theme).map(item =>
+                            ...finalGroups.get(theme).map(item =>
                               jsx(ReviewRow, {
                                 key: item.id, item, checked: Boolean(selected[item.id]), verdict: verdicts[item.id],
                                 editing: editingId === item.id,
