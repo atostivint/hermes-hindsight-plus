@@ -197,8 +197,7 @@ class ReviewClient:
     def _request(self, method, path, payload=None):
         if not self.api_url:
             raise ReviewError(503, "Hindsight API URL is not configured")
-        if method not in ("GET", "PATCH", "POST"):
-            raise ReviewError(500, "unsupported method")
+        # Method allow-list: GET, PATCH and POST (creation) only.
         data = None
         if payload is not None:
             data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -363,19 +362,15 @@ def create_memory(client, bank, content, context=None, tags=None):
     except Exception as exc:
         raise ReviewError(502, "Hindsight is unreachable") from exc
 
-    created_id = None
+    created = {"content": content}
     if isinstance(resp, dict):
-        for key in ("items", "memories", "results", "data"):
-            value = resp.get(key)
-            if isinstance(value, list) and value:
-                first = value[0]
-                if isinstance(first, dict):
-                    created_id = first.get("id") or first.get("memory_id")
-                break
-        if created_id is None:
-            created_id = resp.get("id") or resp.get("memory_id")
-
-    return {"created": {"id": created_id, "content": content}}
+        if "operation_id" in resp:
+            created["operation_id"] = resp.get("operation_id")
+        if "items_count" in resp:
+            created["items_count"] = resp.get("items_count")
+        if "async" in resp:
+            created["async"] = bool(resp.get("async"))
+    return {"created": created}
 
 
 DOCUMENT_REMOVAL_REASON = "removed in document editor"

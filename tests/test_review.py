@@ -385,8 +385,59 @@ def test_client_never_issues_delete_or_put(review):
     source = (ROOT / "review.py").read_text("utf-8")
     assert '"DELETE"' not in source
     assert '"PUT"' not in source
-    # POST is now allowed, but only for /memories creation.
-    assert '"POST"' in source
+    assert source.count('"POST"') == 1
+    assert "def create_memory" in source
+    # the single POST lives inside create_memory
+    post_index = source.index('"POST"')
+    create_index = source.index("def create_memory")
+    assert post_index > create_index
+    assert "/memories" in source
+
+
+def test_create_memory_body(review, monkeypatch):
+    import json
+
+    captured = {}
+
+    class FakeClient:
+        def _request(self, method, path, payload=None):
+            captured["method"] = method
+            captured["path"] = path
+            captured["payload"] = payload
+            return {"success": True, "bank_id": "hermes", "items_count": 1, "async": False}
+
+        @staticmethod
+        def _base(bank):
+            return "/v1/default/banks/" + bank
+
+    client = FakeClient()
+    result = review.create_memory(client, "hermes", "hello", context="ctx", tags=["t1"])
+    assert captured["method"] == "POST"
+    assert "memories" in captured["path"]
+    payload = captured["payload"]
+    assert isinstance(payload["items"], list) and len(payload["items"]) == 1
+    assert payload["async"] is False
+    item = payload["items"][0]
+    assert set(item.keys()) == {"content", "context", "tags"}
+    assert item["content"] == "hello"
+    assert item["context"] == "ctx"
+    assert item["tags"] == ["t1"]
+
+    # without context/tags, item carries only content
+    captured2 = {}
+
+    class FakeClient2:
+        def _request(self, method, path, payload=None):
+            captured2["payload"] = payload
+            return {"success": True, "bank_id": "hermes", "items_count": 1, "async": False}
+
+        @staticmethod
+        def _base(bank):
+            return "/v1/default/banks/" + bank
+
+    review.create_memory(FakeClient2(), "hermes", "world")
+    item2 = captured2["payload"]["items"][0]
+    assert set(item2.keys()) == {"content"}
 
 
 # --- check with Hermes ---------------------------------------------------------

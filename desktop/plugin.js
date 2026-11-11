@@ -1064,7 +1064,7 @@ function MemoryReviewPage() {
     setBusy(true)
     setNotice('')
     try {
-      await reviewPost(`/review/${bank}/memories`, {
+      const result = await reviewPost(`/review/${bank}/memories`, {
         content,
         context: newContext.trim(),
         tags
@@ -1073,7 +1073,12 @@ function MemoryReviewPage() {
       setNewContext('')
       setNewTags('')
       setShowAdd(false)
-      setNotice('Souvenir ajoute.')
+      const asyncFlag = result && result.created && result.created.async
+      setNotice(
+        asyncFlag
+          ? 'Souvenir enregistre. L extraction continue en arriere-plan.'
+          : 'Souvenir enregistre.'
+      )
       refresh()
     } catch (error) {
       setNotice(`Ajout impossible : ${String(error && error.message ? error.message : error)}`)
