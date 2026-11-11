@@ -8,6 +8,26 @@ The agent half is installed by Hermes. The desktop half is published by Hermes' 
 on install — but only when the copy it already has is provably the package's own file (see
 the trap below).
 
+## Topology
+
+The two halves do not live on the same machine, and that is not obvious from inside the app:
+
+* the **desktop half** (`plugin.js`) loads **locally**, from the `desktop-plugins/` of the
+  machine running the Desktop app;
+* the **plugin API** (`/api/plugins/hermes-hindsight-plus/...`, `review.py`) is served by the
+  **gateway of the host the app is connected to**. A Desktop app can be a plain remote client:
+  its `desktop.json` `connectionMode` and `remoteUrl` may even be stale, so trust the boot line
+  in `logs/desktop.log` (`Connecting to remote Hermes backend at ...`) over the config file.
+
+So a route the new version adds is only reachable once **the backend gateway** restarted, even
+though the app that asked for it runs locally. A version bump must therefore reach both the
+backend install and the local desktop half; a new route additionally needs the backend gateway
+restarted. Measured 2026-11-11 on this deployment: the Windows Desktop app boots with
+`[boot] Connecting to remote Hermes backend at https://oracle.blue-avior.ts.net`, so that
+tailnet front is the endpoint serving `/api/plugins/...` — there is no local API host to restart
+on Windows. `scripts/deploy.ps1 -Target all` covers both halves, and `-RestartApi` restarts the
+backend gateway and proves the restart took.
+
 ## Fresh host
 
 ```bash
@@ -46,20 +66,41 @@ The code was correct and installed; the server had not been restarted.
 
 Two cases:
 
-* **Desktop app on Windows** — the app serves the plugin API itself (`hermes serve --status`
-  reports no dashboard/serve process). Quit it completely, tray icon included, then relaunch
-  it. `scripts/deploy.ps1` prints this step and never does it for you: that window is yours.
-* **Headless host** (`hermes serve` / `hermes dashboard`, e.g. `oracle`) — restart it:
-  `hermes serve --stop`, then start it again (or let the app start it).
+* **systemd host** (the gateway runs as `hermes-gateway.service`, e.g. a headless backend) —
+  `hermes gateway restart` refuses without root: use
+  `sudo systemctl restart hermes-gateway.service` (passwordless sudo as the service user on
+  the known host), then `systemctl is-active hermes-gateway.service` until it prints `active`.
+* **Desktop app without that service** — when it really serves the plugin API itself, quit it
+  completely, tray icon included, then relaunch it. `scripts/deploy.ps1` prints this step and
+  never does it for you: that window is yours.
 
-`pwsh -File scripts/deploy.ps1 -Target all -RestartApi` handles the headless case: it asks
-`hermes serve --status` on each host, stops and restarts `hermes serve` only when a process is
-listed, and does nothing when none is. It never touches the Desktop app and never kills a
-process by name.
+`pwsh -File scripts/deploy.ps1 -Target all -RestartApi` does the restart and proves it. On the
+Linux host it runs `sudo systemctl restart hermes-gateway.service`, waits for `active`, then
+checks one invariant: **the gateway process must have started after `dashboard/plugin_api.py`
+was last written**, because that file is what builds the route table.
+
+```bash
+PID=$(systemctl show -p MainPID --value hermes-gateway.service)
+stat -c %Y /proc/$PID                                        # process start, epoch seconds
+stat -c %Y "$HOME/.hermes/plugins/hermes-hindsight-plus/dashboard/plugin_api.py"
+```
+
+If the process start is older than the file's mtime, the script fails with
+`route table is older than the plugin: restart did not take`; otherwise it prints both epochs
+and the delta between them. On Windows there is nothing to restart: the Desktop app is a remote
+client of the oracle backend, so `/api/plugins/...` is not served by a gateway on that machine.
+The script says so, never kills a process by name, and never touches the Desktop app.
+
+There is deliberately **no HTTP probe**. On this deployment an unauthenticated request proves
+nothing: the tailnet front answers `401` for *every* path — a bogus
+`/api/plugins/hermes-hindsight-plus/zzz-nope` included — so a `401` cannot distinguish an
+existing route from a missing one. The mtime/start-time comparison is auth-free and
+deterministic.
 
 How to tell this apart from a routing bug: the route exists in the code and in the installed
-package, older routes on the same router answer, the new one is the only 404 — and a restart
-makes it answer.
+package, older routes on the same router answer, the new one is the only 404 — and after a
+restart the gateway process start time is newer than `plugin_api.py`, while a stale table means
+the process started before the file was written.
 
 ## The `.hermes-package.json` trap
 

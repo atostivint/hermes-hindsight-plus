@@ -24,6 +24,7 @@ File de travail réelle. Une ligne par item ; `done` = mergé et vérifié, `rea
 | HH-16 | Nits backend : `needs_review` sur `<= 0`, docstring de la route décisions, `le=` évalué à l'import, `getattr` mort | dashboard-backend | done | 4 tests dont `a_broken_review_module_does_not_break_the_dashboard_api` ; poussé `b649f1e` |
 | HH-17 | Release 0.6.0 : `plugin.yaml`, `dashboard/manifest.json`, README (section Memory review + cartes) | packaging-docs | done | 133 passed, validate ok ; poussé `e142d11` |
 | HH-18 | Déploiement 0.6.0 sur Oracle + Windows | ops | done | `deploy.ps1 -Target all` : v0.6.0 des deux côtés, sha256 `d08d16d5…` identiques, aucune erreur de garde |
+| HH-19 | Une route HTTP neuve répond 404 après déploiement : `hermes plugins install` ne recharge que les hooks, pas la table des routes ; l'app bureau sert l'API elle-même et tournait d'avant le déploiement | packaging-docs | done | `deploy.ps1` imprime désormais l'avertissement après chaque install et `-RestartApi` relance un `hermes serve` headless ; 137 tests ; poussé `4eeb51c` — reste à faire côté utilisateur : quitter/relancer l'app bureau |
 
 <!-- Exemple de ligne (à supprimer au premier vrai item) :
 | HH-1 | Un modèle absent renvoie 404 : le hook crée le modèle une fois puis n'injecte rien au tour courant | plugin-core | ready | pytest tests/test_plugin.py -k create_missing + git diff --stat |

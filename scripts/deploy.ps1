@@ -19,7 +19,16 @@
     running gateway; it does NOT rebuild the dashboard/HTTP route table, so a route the new
     version adds keeps answering 404 until the API host is restarted (measured 2026-11-11 on
     the v0.6.0 deploy: the install reported "active in the running gateway now: hooks", the
-    list route kept working, and the new route 404'd until the Desktop app was relaunched).
+    list route kept working, and the new route 404'd until the API host was restarted).
+    Measured the same day: the Desktop app on Windows runs as a remote CLIENT of the oracle
+    backend ("[boot] Connecting to remote Hermes backend at https://oracle.blue-avior.ts.net"),
+    so its /api/plugins/... calls land there while the desktop half loads locally from
+    desktop-plugins/. A new route therefore needs the backend gateway restarted; on the Linux
+    host `hermes gateway restart` refuses without root, so the restart is
+    `sudo systemctl restart hermes-gateway.service`. -RestartApi then checks, without any HTTP
+    call, that the gateway process started after dashboard/plugin_api.py was last written: an
+    unauthenticated 401 proves nothing behind the tailnet auth gate (every path answers 401,
+    a bogus one included).
     It also does NOT refresh an already published desktop half whose bytes differ from the
     package's:
     such a copy carries no .hermes-package.json marker, so the reconciler treats it as the
@@ -42,12 +51,17 @@
     Print the planned commands instead of running them. No network, no write.
 
 .PARAMETER RestartApi
-    After each host's deploy, run `hermes serve --status`; when it reports a running
-    dashboard/serve process, stop it with `hermes serve --stop` and start `hermes serve`
-    again (detached), on this machine and over ssh for `oracle`. When nothing is running it
-    says so and does nothing. It never touches the Desktop app, which serves the plugin API
-    itself on Windows: relaunching that app stays a human step. With -DryRun it only prints
-    what it would run. Default: off.
+    After each host's deploy, restart the API host and prove the route table is current.
+    oracle: `sudo systemctl restart hermes-gateway.service` (`hermes gateway restart` refuses
+    without root), wait for `systemctl is-active` to report active, then compare the gateway
+    process start time (`stat -c %Y /proc/<MainPID>`) with the mtime of
+    dashboard/plugin_api.py and fail when the process started before the file was written
+    ("route table is older than the plugin: restart did not take").
+    windows: nothing to restart -- the Desktop app is a remote client of the oracle backend,
+    so /api/plugins/... is served there, not by a gateway on this machine; the script says so.
+    It never kills a process by name, never makes an HTTP request, and never touches the
+    Desktop app, so relaunching that app stays a human step. With -DryRun it only prints what
+    it would run. Default: off.
 
 .EXAMPLE
     pwsh -File scripts/deploy.ps1 -Target all -DryRun
@@ -77,6 +91,14 @@ $PluginId = 'hermes-hindsight-plus'
 $RepoUrl = 'https://github.com/atostivint/hermes-hindsight-plus.git'
 $RepoRoot = Split-Path -Parent $PSScriptRoot
 $Manifest = Join-Path $RepoRoot 'plugin.yaml'
+
+# The restart is judged by one deterministic, auth-free invariant: the gateway process must
+# have started after dashboard/plugin_api.py was last written. Measured 2026-11-11, no HTTP
+# code can stand in for it: the tailnet front answers 401 for every path (a bogus
+# /api/plugins/hermes-hindsight-plus/zzz-nope included), and nothing listens on 127.0.0.1:9119
+# on the oracle host (the gateway speaks over the Unix socket
+# /var/lib/hermes-agent/.hermes/gateway.sock; 127.0.0.1:8787 is the separate webui, which also
+# 401s everything).
 
 # ---------------------------------------------------------------- version banner
 
@@ -127,12 +149,16 @@ function Invoke-Install {
 # hooks"). The dashboard/HTTP route table is built when the process serving the plugin API
 # starts, so a route the new version adds answers 404 {"detail":"Not Found"} while routes that
 # already existed keep working -- the shape of the bug: the list route fine, the new route
-# 404 on first click. On this machine the Desktop app serves that API itself (`hermes serve
-# --status` reports no dashboard/serve process), so relaunching the app is what loads the new
-# routes; on a headless host it is `hermes serve` / `hermes dashboard` that must restart.
+# 404 on first click. On a headless host it is the gateway service (or `hermes serve` /
+# `hermes dashboard`) that must restart. The Desktop app can be a remote CLIENT of that host:
+# its /api/plugins/... calls then land there, while the desktop half of the plugin loads from
+# desktop-plugins/ on the machine running the app -- hence both hosts, and the backend restart.
 #
 # This script never kills a process by name and never touches the Desktop app: it prints that
-# step, and with -RestartApi it drives only the operator's own `hermes serve` CLI.
+# step; with -RestartApi it restarts the backend service on the Linux host, then proves the
+# table was rebuilt by comparing the gateway process start time with plugin_api.py's mtime.
+# No HTTP probe: measured 2026-11-11, the tailnet front answers 401 for every path, a bogus
+# one included, so a 401 says nothing about whether a route exists.
 
 function Write-RestartGuidance {
     param([Parameter(Mandatory)][string]$HostLabel)
@@ -145,22 +171,19 @@ function Write-RestartGuidance {
     Write-Host '  until the process that serves the plugin API is restarted. Routes that already'
     Write-Host '  existed keep working -- that is exactly why the old list route looks fine and'
     Write-Host '  the new route 404s.'
-    Write-Host '  * Desktop app on Windows (it serves the plugin API itself): quit the app'
-    Write-Host '    completely (tray icon too) and relaunch it. This script never does that.'
-    Write-Host '  * headless host (`hermes serve` / `hermes dashboard`): `hermes serve --stop`,'
+    Write-Host '  * headless host (systemd unit hermes-gateway.service): `hermes gateway restart`'
+    Write-Host '    refuses without root -- use `sudo systemctl restart hermes-gateway.service`,'
+    Write-Host '    then `systemctl is-active` until it says active.'
+    Write-Host '  * no systemd (`hermes serve` / `hermes dashboard`): `hermes serve --stop`,'
     Write-Host '    then start it again (or let the app start it).'
-    Write-Host '  -RestartApi performs that headless restart for you when a serve process is running.'
-}
-
-function Test-ApiServeRunning {
-    param([string]$StatusText)
-
-    # `hermes serve --status` (hermes_cli/main_dashboard.py, _report_dashboard_status) prints
-    # "No hermes dashboard or serve processes running." with exit 0 when there is nothing to
-    # restart, and "<n> hermes dashboard/serve process(es) running:" plus "PID ..." lines
-    # otherwise. Match the running header only: the negative line contains "or serve".
-    if ([string]::IsNullOrWhiteSpace($StatusText)) { return $false }
-    return ($StatusText -match '(?i)dashboard/serve process')
+    Write-Host '  * Desktop app: it can be a remote client of that backend, so its /api/plugins/...'
+    Write-Host '    calls go to the backend and the backend is what must restart. Quit the app'
+    Write-Host '    completely (tray icon too) and relaunch it only when it serves the API itself.'
+    Write-Host '    This script never does that.'
+    Write-Host '  Proof: after the restart, the gateway process must have started after'
+    Write-Host '  dashboard/plugin_api.py was last written. -RestartApi checks that with stat'
+    Write-Host '  and prints both epochs; an HTTP 401 proves nothing here (every path answers'
+    Write-Host '  401 behind the tailnet auth gate, a bogus path included).'
 }
 
 function Write-StatusLines {
@@ -174,80 +197,20 @@ function Write-StatusLines {
 function Invoke-RestartApiWindows {
     Write-Host '  [restart] API host (windows): -RestartApi' -ForegroundColor Cyan
 
+    # Measured 2026-11-11: this Desktop app is a remote client of the oracle backend (boot
+    # line "[boot] Connecting to remote Hermes backend at https://oracle.blue-avior.ts.net"),
+    # so /api/plugins/... is served by that gateway, not by anything running here. There is
+    # nothing to restart and nothing to prove locally: the oracle half of -RestartApi counts.
     if ($DryRun) {
-        Write-Host '    would run: hermes serve --status'
-        Write-Host '    if it reports a dashboard/serve process: hermes serve --stop'
-        Write-Host '      then start detached: hermes serve'
-        Write-Host '    if nothing runs: nothing to stop, nothing to start'
-        Write-Host '    the Desktop app is never touched, even when it is the API host'
-        return
+        Write-Host '    would run: nothing -- this host is a remote client, not the API host'
     }
-
-    $status = ''
-    try {
-        $status = (& hermes serve --status | Out-String)
-        $statusExit = $LASTEXITCODE
-    } catch {
-        Write-Host "    could not run 'hermes serve --status': $($_.Exception.Message)" -ForegroundColor Yellow
-        Write-Host '    restart the API host by hand, as in the guidance above.' -ForegroundColor Yellow
-        return
-    }
-    Write-StatusLines -Text $status
-
-    if (-not (Test-ApiServeRunning -StatusText $status)) {
-        Write-Host '    no hermes serve/dashboard process is running: nothing to restart.' -ForegroundColor Yellow
-        Write-Host '    (when the Desktop app serves the API, quit and relaunch it by hand.)'
-        return
-    }
-
-    Write-Host "    'hermes serve --status' (exit $statusExit) lists a serve process: restarting it"
-    Write-Host '  hermes serve --stop'
-    try {
-        & hermes serve --stop
-        $stopExit = $LASTEXITCODE
-    } catch {
-        Write-Host "    error: could not run 'hermes serve --stop': $($_.Exception.Message)" -ForegroundColor Red
-        Write-Host '    start the API host by hand; new routes stay 404 until then.' -ForegroundColor Yellow
-        return
-    }
-    if ($stopExit -ne 0) {
-        Write-Host "    error: 'hermes serve --stop' exited $stopExit" -ForegroundColor Red
-        Write-Host '    start the API host by hand; new routes stay 404 until then.' -ForegroundColor Yellow
-        return
-    }
-
-    $hermesExe = $null
-    try {
-        $hermesExe = (Get-Command hermes -ErrorAction Stop).Source
-    } catch {
-        Write-Host "    error: hermes is not on PATH: $($_.Exception.Message)" -ForegroundColor Red
-        return
-    }
-    try {
-        Start-Process -FilePath $hermesExe -ArgumentList 'serve' -WindowStyle Hidden -ErrorAction Stop
-    } catch {
-        Write-Host "    error: could not start 'hermes serve': $($_.Exception.Message)" -ForegroundColor Red
-        Write-Host '    start the API host by hand; new routes stay 404 until then.' -ForegroundColor Yellow
-        return
-    }
-    Write-Host '    started detached: hermes serve'
-    Write-Host '    (default flags; if the previous process used --port/--isolated, start it the same way)'
-
-    Start-Sleep -Seconds 3
-    $after = ''
-    try {
-        $after = (& hermes serve --status | Out-String)
-    } catch {
-        Write-Host "    could not re-check 'hermes serve --status': $($_.Exception.Message)" -ForegroundColor Yellow
-        return
-    }
-    Write-StatusLines -Text $after
-    if (Test-ApiServeRunning -StatusText $after) {
-        Write-Host '  ok: API host restarted' -ForegroundColor Green
-    } else {
-        Write-Host '    the restarted process is not listed yet; check `hermes serve --status` shortly' -ForegroundColor Yellow
-    }
+    Write-Host '    nothing to restart here: the Desktop app is a remote client of the oracle'
+    Write-Host '    backend (boot line: [boot] Connecting to remote Hermes backend at'
+    Write-Host '    https://oracle.blue-avior.ts.net), so /api/plugins/... is served there.'
+    Write-Host '    No local hermes serve to stop, no route probe, no file touched.'
+    Write-Host '    (a gateway that did serve the API here would still need the restart above)'
 }
+
 
 # --------------------------------------------------------------- windows target
 
@@ -424,39 +387,99 @@ echo "  ok: oracle deployed (installed and checked; new routes need the API host
 # bash on stdin must never see a CR: normalise whichever line endings this file has.
 $OracleScript = ($OracleScript -replace "`r`n", "`n").TrimEnd()
 
-# ------------------------------------------------ oracle: is a serve process running?
+# ---------------------------- oracle: restart the gateway, then prove the route table is new
 #
-# Same two pieces of evidence as the local half, asked over ssh. `hermes serve --status` exits
-# with the count of live processes, so the exit code is normalised to 0 here and the decision
-# is taken on the text alone. ASCII only, same BOM guard as $OracleScript.
-$OracleStatusScript = @'
+# Measured 2026-11-11: `hermes gateway restart` refuses on this host ("requires root"), while
+# `sudo systemctl restart hermes-gateway.service` works (passwordless sudo). The restart goes
+# through the service, the unit must come back active, and then one invariant decides whether
+# the route table was rebuilt: the gateway process must have started after
+# dashboard/plugin_api.py was last written, because that file is what builds the table. No HTTP
+# probe -- measured the same day, the tailnet front answers 401 for EVERY path (a bogus
+# /api/plugins/hermes-hindsight-plus/zzz-nope included), nothing listens on 127.0.0.1:9119 on
+# the host (the gateway speaks over a Unix socket the ssh user cannot read, and 127.0.0.1:8787
+# is the separate webui, which also 401s everything), so a 401 proves nothing about a route.
+# ASCII only, same BOM guard as $OracleScript.
+$OracleRestartCheckScript = @'
 : 2>/dev/null; set -u
 export PATH="$HOME/.local/bin:/usr/local/bin:$PATH"
-HERMES_BIN="$(command -v hermes || true)"
-if [ -z "$HERMES_BIN" ]; then echo "error: hermes not found on PATH" >&2; exit 1; fi
-STATUS="$("$HERMES_BIN" serve --status)"
-printf '%s\n' "$STATUS"
-exit 0
-'@
-$OracleStatusScript = ($OracleStatusScript -replace "`r`n", "`n").TrimEnd()
+H="${HERMES_HOME:-$HOME/.hermes}"
+SVC="hermes-gateway.service"
+API_FILE="$H/plugins/hermes-hindsight-plus/dashboard/plugin_api.py"
 
-# The restart itself: stop, then start detached. `hermes serve` is a foreground server, so it
-# is started with nohup and its stdout/stderr detached; otherwise ssh would wait on it.
-$OracleRestartScript = @'
-: 2>/dev/null; set -u
-export PATH="$HOME/.local/bin:/usr/local/bin:$PATH"
-HERMES_BIN="$(command -v hermes || true)"
-if [ -z "$HERMES_BIN" ]; then echo "error: hermes not found on PATH" >&2; exit 1; fi
-echo "  hermes serve --stop"
-if ! "$HERMES_BIN" serve --stop; then
-  echo "error: hermes serve --stop failed; start the API host by hand" >&2
+echo "  sudo systemctl restart $SVC   ('hermes gateway restart' refuses without root)"
+if ! sudo systemctl restart "$SVC"; then
+  echo "error: 'sudo systemctl restart $SVC' failed" >&2
   exit 1
 fi
-echo "  start detached: hermes serve"
-nohup "$HERMES_BIN" serve >/dev/null 2>/dev/null &
-echo "  started pid $!"
+
+# A restart that comes back dead is not a success: wait for the unit to report active.
+STATE=""
+N=0
+while [ "$N" -lt 30 ]; do
+  STATE="$(systemctl is-active "$SVC" 2>/dev/null || true)"
+  if [ "$STATE" = "active" ]; then break; fi
+  N=$((N + 1))
+  sleep 1
+done
+echo "  $SVC: ${STATE:-unknown}"
+if [ "$STATE" != "active" ]; then
+  echo "error: $SVC is '${STATE:-unknown}' after 30s, not 'active'" >&2
+  exit 1
+fi
+
+# Deterministic and auth-free: the route table is built from plugin_api.py when the gateway
+# process starts, so that process must have started at or after the file's last write.
+# /proc/<PID> carries the process start time as its directory mtime; stat -c %Y is epoch secs.
+if [ ! -f "$API_FILE" ]; then
+  echo "error: plugin API file not found: $API_FILE" >&2
+  exit 1
+fi
+
+PID="$(systemctl show -p MainPID --value "$SVC" 2>/dev/null || true)"
+case "$PID" in
+  ''|0)
+    echo "error: $SVC reports no MainPID ('${PID:-empty}')" >&2
+    exit 1
+    ;;
+esac
+if [ ! -d "/proc/$PID" ]; then
+  echo "error: /proc/$PID does not exist for $SVC" >&2
+  exit 1
+fi
+
+START="$(stat -c %Y "/proc/$PID" 2>/dev/null || true)"
+FILE="$(stat -c %Y "$API_FILE" 2>/dev/null || true)"
+case "$START" in
+  ''|*[!0-9]*) echo "error: could not read the start time of /proc/$PID" >&2; exit 1 ;;
+esac
+case "$FILE" in
+  ''|*[!0-9]*) echo "error: could not read the mtime of $API_FILE" >&2; exit 1 ;;
+esac
+
+echo "  gateway MainPID $PID"
+echo "  gateway started  $START (epoch seconds)"
+echo "  plugin_api.py    $FILE (epoch seconds, last write)"
+
+if [ "$START" -lt "$FILE" ]; then
+  echo "error: route table is older than the plugin: restart did not take" >&2
+  echo "       gateway start $START < plugin_api.py mtime $FILE" >&2
+  exit 1
+fi
+
+DELTA=$((START - FILE))
+HOURS=$((DELTA / 3600))
+MINS=$((DELTA % 3600 / 60))
+SECS=$((DELTA % 60))
+echo "  gateway started ${DELTA}s (${HOURS}h ${MINS}m ${SECS}s) after plugin_api.py was written"
+echo "  ok: the running gateway is newer than the installed route table"
+exit 0
 '@
-$OracleRestartScript = ($OracleRestartScript -replace "`r`n", "`n").TrimEnd()
+# bash on stdin must never see a CR. Note the trailing newline: PowerShell appends
+# [Environment]::NewLine to each object piped to a native command, so a script ending
+# without one ends its LAST line as "exit 0<CR>" -- bash then reads the argument as
+# "0<CR>" and prints "exit: 0: numeric argument required" (measured 2026-11-11). With the
+# explicit newline, `exit 0` is a clean line and bash leaves before the appended CR.
+$OracleRestartCheckScript = ($OracleRestartCheckScript -replace "`r`n", "`n").TrimEnd() + "`n"
 
 # Run one of the ASCII scripts above on the remote host and return (exit, output).
 function Invoke-OracleScript {
@@ -479,57 +502,30 @@ function Invoke-RestartApiOracle {
 
     if ($DryRun) {
         Write-Host "    would run over ssh: $OracleHost 'bash -s' (script below)"
-        Write-Host '    script: hermes serve --status; stop + start only when that lists a process'
-        foreach ($line in ($OracleRestartScript -split "`n")) { Write-Host "      $line" }
-        Write-Host '    if nothing runs: nothing to stop, nothing to start'
+        Write-Host '    it restarts the systemd unit, waits for it to be active, then compares the'
+        Write-Host '    gateway process start time with dashboard/plugin_api.py s mtime:'
+        foreach ($line in ($OracleRestartCheckScript -split "`n")) { Write-Host "      $line" }
+        Write-Host '    gateway started after the file was written = the route table is current;'
+        Write-Host '    started before it = "route table is older than the plugin: restart did not take"'
         return
     }
 
-    $probe = $null
+    $check = $null
     try {
-        $probe = Invoke-OracleScript -Script $OracleStatusScript
+        $check = Invoke-OracleScript -Script $OracleRestartCheckScript
     } catch {
         Write-Host "    could not reach ${OracleHost}: $($_.Exception.Message)" -ForegroundColor Yellow
         Write-Host '    restart the API host by hand, as in the guidance above.' -ForegroundColor Yellow
         return
     }
-    Write-StatusLines -Text $probe.Output
-    if ($probe.ExitCode -ne 0) {
-        Write-Host "    could not read 'hermes serve --status' on ${OracleHost} (ssh exit $($probe.ExitCode))" -ForegroundColor Yellow
-        Write-Host '    restart the API host by hand, as in the guidance above.' -ForegroundColor Yellow
+    Write-StatusLines -Text $check.Output
+    if ($check.ExitCode -eq 0) {
+        Write-Host "  ok: $OracleHost restarted; its gateway is newer than the installed route table" -ForegroundColor Green
         return
     }
-    if (-not (Test-ApiServeRunning -StatusText $probe.Output)) {
-        Write-Host "    no hermes serve/dashboard process is running on ${OracleHost}: nothing to restart." -ForegroundColor Yellow
-        return
-    }
-
-    $restart = $null
-    try {
-        $restart = Invoke-OracleScript -Script $OracleRestartScript
-    } catch {
-        Write-Host "    error: could not restart ${OracleHost}: $($_.Exception.Message)" -ForegroundColor Red
-        return
-    }
-    Write-StatusLines -Text $restart.Output
-    if ($restart.ExitCode -ne 0) {
-        Write-Host "    error: restart failed on ${OracleHost} (ssh exit $($restart.ExitCode))" -ForegroundColor Red
-        return
-    }
-    Start-Sleep -Seconds 3
-    $after = $null
-    try {
-        $after = Invoke-OracleScript -Script $OracleStatusScript
-    } catch {
-        Write-Host "    could not re-check ${OracleHost}: $($_.Exception.Message)" -ForegroundColor Yellow
-        return
-    }
-    Write-StatusLines -Text $after.Output
-    if (Test-ApiServeRunning -StatusText $after.Output) {
-        Write-Host "  ok: API host restarted on $OracleHost" -ForegroundColor Green
-    } else {
-        Write-Host "    the restarted process is not listed yet on ${OracleHost}; re-check by hand" -ForegroundColor Yellow
-    }
+    Write-Host "  error: restart check failed on ${OracleHost} (ssh exit $($check.ExitCode))" -ForegroundColor Red
+    Write-Host '    "route table is older than the plugin" above means the restart did not take.' -ForegroundColor Yellow
+    exit 1
 }
 
 function Deploy-Oracle {
@@ -572,5 +568,7 @@ if ($Target -in @('oracle', 'all')) { Deploy-Oracle }
 
 Write-Host ''
 Write-Host "deploy complete: $Target, version $Version (installed and checked)" -ForegroundColor Green
-Write-Host 'Routes: restart the API host (Desktop app or hermes serve) before a new route answers'
+Write-Host 'Routes: restart the backend gateway before a new route answers'
+Write-Host '  (systemd: sudo systemctl restart hermes-gateway.service; else hermes serve --stop + start)'
+Write-Host '  -RestartApi does it and proves the gateway process is newer than plugin_api.py.'
 Write-Host 'Not verified here: that the Desktop pane actually renders. Open it and look.'
