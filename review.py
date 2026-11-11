@@ -10,16 +10,28 @@ Nothing here issues ``DELETE`` and nothing retains new facts.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import urllib.error
 import urllib.parse
 import urllib.request
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 BANKS = ("hermes", "atlas", "astro")
 CURATABLE_TYPES = ("world", "experience")
 MAX_PAGE = 200
+# The review list ranks across the whole bank, so it scans more than one page. The
+# window is bounded: at most MAX_SCAN facts are fetched and scored, MAX_PAGE at a
+# time. A larger bank is reported as ``truncated`` rather than paged through here.
+MAX_SCAN = 2000
+# The window must not become an unbounded number of upstream round-trips: a server
+# answering one row per page would cost MAX_SCAN calls at ``timeout_s`` each. The
+# cap is the number of full pages the window needs (``MAX_SCAN / MAX_PAGE``, i.e.
+# 10) times four, so a well-behaved server is never cut off while a pathological one
+# is stopped after MAX_CALLS calls (40 for the current values). Reaching the cap is
+# reported through ``truncated``, like any other early stop.
+MAX_CALLS = 4 * -(-MAX_SCAN // MAX_PAGE)
 MAX_TEXT_CHARS = 4000
 MAX_REASON_CHARS = 500
 MAX_MEMORY_CONTENT = 2000
@@ -126,6 +138,7 @@ def score_item(item, now=None):
     return {
         "id": str(item.get("id") or ""),
         "text": text,
+        "text_hash": text_hash(text),
         "context": item.get("context") or "",
         "tags": item.get("tags") if isinstance(item.get("tags"), list) else [],
         "date": date_value,
@@ -141,10 +154,16 @@ def score_item(item, now=None):
     }
 
 
-def sort_items(items, sort):
-    """Sort scored items, most stale first. Unknown ages sort as the freshest."""
+def check_sort(sort):
+    """Reject an unknown sort key with the 400 both callers report."""
     if sort not in _SORTS:
         raise ReviewError(400, "sort must be one of: " + ", ".join(_SORTS))
+    return sort
+
+
+def sort_items(items, sort):
+    """Sort scored items, most stale first. Unknown ages sort as the freshest."""
+    check_sort(sort)
     key = {"age": "age_score", "volatile": "volatile_score", "staleness": "staleness"}[sort]
     tiebreak = "staleness" if key != "staleness" else "age_score"
     return sorted(items, key=lambda it: (it[key], it[tiebreak]), reverse=True)
@@ -250,24 +269,143 @@ class ReviewClient:
 # --- operations ------------------------------------------------------------------
 
 
-def list_review(client, bank, limit=100, offset=0, state="valid", sort="staleness", q="", now=None):
-    """List one page of a bank's facts, scored and sorted client-side."""
+def _scan(client, bank, state, q, now, max_scan):
+    """Fetch and score up to ``max_scan`` facts, following the upstream ``offset``.
+
+    Returns ``(scored, total, truncated)``: the scored facts in upstream order, the
+    upstream ``total`` as the response carries it (``None`` when the server sent
+    none) and whether the scan stopped before the bank was fully read. Every exit
+    is bounded: an empty page, a page that only repeated facts already seen (a server
+    ignoring ``offset``), the at most ``MAX_CALLS`` upstream calls, the reported total,
+    or the window. ``truncated`` is derived from the reported total and what was
+    actually scored, so a scan that stopped on a repeated page, the call cap or the
+    window while the bank is larger reports ``True``.
+    """
+    scored = []
+    seen = set()
+    total = None
+    total_int = None
+    scan_offset = 0
+    calls = 0
+    while len(scored) < max_scan and calls < MAX_CALLS:
+        page_size = min(MAX_PAGE, max_scan - len(scored))
+        calls += 1
+        raw = client.list_memories(bank, page_size, scan_offset, state=state, q=q)
+        raw = raw if isinstance(raw, dict) else {}
+        if total is None:
+            total = raw.get("total")
+            if isinstance(total, bool):
+                total_int = None
+            else:
+                try:
+                    total_int = int(total)
+                except (TypeError, ValueError):
+                    total_int = None
+        entries = raw.get("items")
+        entries = entries if isinstance(entries, list) else []
+        if not entries:
+            break  # empty page: nothing left upstream
+        rows = 0
+        known = 0
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            rows += 1
+            entry_id = str(entry.get("id") or "")
+            if not entry_id:
+                continue  # no id: it can be neither curated, ranked nor deduped
+            if entry_id in seen:
+                known += 1
+                continue
+            seen.add(entry_id)
+            scored.append(score_item(entry, now))
+            if len(scored) >= max_scan:
+                break
+        if not rows:
+            break  # the page carried no usable row
+        if known == rows:
+            break  # the page repeated only facts already seen: offset is ignored
+        scan_offset += len(entries)
+        if total_int is not None and len(scored) >= total_int:
+            break
+    truncated = (total_int is not None and total_int > len(scored)) or (
+        total_int is None and len(scored) >= max_scan
+    )
+    return scored, total, truncated
+
+
+def needs_review(item, decisions=None, now=None):
+    """The single queue predicate: the fact is stale and the ledger has not settled it.
+
+    ``item`` is a scored item (``score_item``) and ``decisions`` the bank's local
+    ledger (``{memory_id: decision}``, ``None`` for no ledger). This is the only
+    definition of "in the review queue": ``to_review`` counts it and the
+    ``review_only`` filter keeps it, so the badge and the list cannot disagree.
+    """
+    if not isinstance(item, dict):
+        return False
+    # ``staleness > 0`` is the rule, so a negative score must not queue the fact:
+    # plain truthiness would let ``-1`` through.
+    if (item.get("staleness") or 0) <= 0:
+        return False
+    ledger = decisions if isinstance(decisions, dict) else {}
+    return not decision_hides(ledger.get(item.get("id")), item, now)
+
+
+def list_review(client, bank, limit=100, offset=0, state="valid", sort="staleness", q="", now=None,
+                *, review_only=False, decisions=None):
+    """Rank a bank's facts globally, then return one ``offset..offset+limit`` slice.
+
+    The client scans at most ``MAX_SCAN`` facts in at most ``MAX_CALLS`` upstream
+    requests, ``MAX_PAGE`` per call, following the upstream ``offset`` until the
+    reported ``total`` is reached or the window is full. ``truncated`` says the scan
+    stopped before the bank was fully read: a larger bank was cut by the window, the
+    call cap was reached, or the server answered a page that brought nothing new.
+    Every scanned fact is scored, so the ranking covers the whole scanned bank and
+    not one upstream page.
+
+    ``offset`` is a best-effort cursor, not a snapshot: the ranking is recomputed on
+    every call from a fresh scan and a wall-clock age score, so a fact added or
+    removed between two pages can appear twice or not at all. An ``offset`` past
+    ``matched`` returns ``items: []``.
+
+    ``review_only`` keeps only the facts :func:`needs_review` accepts: ``staleness >
+    0`` and no hiding ledger decision. ``sort`` ranks that set and
+    ``limit``/``offset`` slice it. ``q`` is forwarded to Hindsight and never filtered
+    here. ``matched`` is the post-filter count (the size of the set ``offset``/
+    ``limit`` slice), not a ``q`` match count.
+
+    ``decisions`` is that bank's local ledger (``{memory_id: decision}``). A fact is
+    dropped from the queue once the user marked it ``"still true"`` against the same
+    text hash and that decision is younger than ``OK_TTL_DAYS``; any mismatch makes
+    it eligible again. ``to_review`` is the size of the queue the page actually
+    shows, i.e. counted after that ledger filter. ``None`` means no ledger.
+    """
     if not isinstance(limit, int) or not 1 <= limit <= MAX_PAGE:
         raise ReviewError(400, f"limit must be 1..{MAX_PAGE}")
     if not isinstance(offset, int) or offset < 0:
         raise ReviewError(400, "offset must be >= 0")
     if state not in _STATES:
         raise ReviewError(400, "state must be valid or invalidated")
-    raw = client.list_memories(bank, limit, offset, state=state, q=(q or "").strip()[:200])
-    raw_items = raw.get("items") if isinstance(raw, dict) else None
-    items = [score_item(it, now) for it in (raw_items or []) if isinstance(it, dict)]
+    check_sort(sort)
+    scored, total, truncated = _scan(
+        client, bank, state, (q or "").strip()[:200], now, MAX_SCAN
+    )
+    ledger = decisions if isinstance(decisions, dict) else None
+    queue = [item for item in scored if needs_review(item, ledger, now)]
+    kept = queue if review_only else scored
+    ordered = sort_items(kept, sort)
     return {
         "bank": bank,
-        "total": raw.get("total") if isinstance(raw, dict) else None,
+        "total": total,
+        "scanned": len(scored),
+        "truncated": truncated,
+        "matched": len(kept),
+        "to_review": len(queue),
         "offset": offset,
         "limit": limit,
         "sort": sort,
-        "items": sort_items(items, sort),
+        "items": ordered[offset:offset + limit],
     }
 
 
@@ -502,3 +640,120 @@ def parse_verdicts(reply, expected_ids):
         if out:
             break
     return out
+
+
+# --- local review ledger (decision bookkeeping, no I/O) ------------------------
+# The user's "I checked this fact" answer is kept locally, never in Hindsight.
+# ``dashboard/plugin_api.py`` owns the file (``review-decisions.json`` in the
+# plugin data dir) and calls the pure helpers below; this module never touches
+# the filesystem. The vocabulary is the existing ``VERDICTS`` one, not a second
+# list of words.
+
+TEXT_HASH_CHARS = 16
+OK_TTL_DAYS = 90
+MAX_DECISIONS = 5000
+_HASH_RE = re.compile(r"^[0-9a-f]+$")
+
+
+def text_hash(text):
+    """SHA-256 hex digest of a fact's text, truncated to ``TEXT_HASH_CHARS``.
+
+    Lowercase hex by construction (``hexdigest``). Stable for the same text and
+    different for a different one, so it is the fingerprint a ledger decision is
+    tied to: editing the fact makes the old decision stop matching.
+    """
+    return hashlib.sha256(str(text or "").encode("utf-8")).hexdigest()[:TEXT_HASH_CHARS]
+
+
+def check_verdict(verdict):
+    """Normalise a ledger verdict, rejecting anything outside the vocabulary."""
+    value = str(verdict or "").strip().lower()
+    if value not in VERDICTS:
+        raise ReviewError(400, "verdict must be one of: " + ", ".join(VERDICTS))
+    return value
+
+
+def check_text_hash(digest):
+    """Validate a ``text_hash`` value sent by the page."""
+    value = str(digest or "").strip().lower()
+    if len(value) != TEXT_HASH_CHARS or not _HASH_RE.match(value):
+        raise ReviewError(400, "hash must be a 16-character hexadecimal text_hash")
+    return value
+
+
+def decision_hides(decision, item, now=None):
+    """Whether a decision says the fact is current: ``"still true"``, same text, fresh.
+
+    ``item`` is a scored item (``score_item``), so ``text_hash`` is already
+    computed; a raw Hindsight item falls back to hashing its ``text``. A missing,
+    malformed, older-than-``OK_TTL_DAYS`` or mismatching decision never hides
+    anything: the fact simply comes back for review.
+    """
+    if not isinstance(decision, dict) or decision.get("verdict") != "still true":
+        return False
+    if not isinstance(item, dict):
+        return False
+    current = item.get("text_hash")
+    if not isinstance(current, str) or not current:
+        current = text_hash(item.get("text"))
+    if decision.get("hash") != current:
+        return False
+    at = _parse_iso(decision.get("at"))
+    if at is None:
+        return False
+    now = now or datetime.now(timezone.utc)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    return (now - at) < timedelta(days=OK_TTL_DAYS)
+
+
+def record_decision(decisions, memory_id, verdict, text_hash, now=None):
+    """Return a new ``{memory_id: decision}`` mapping with this decision set.
+
+    The input mapping is never mutated. The decision is
+    ``{"verdict", "at", "hash"}``: the fact's text is deliberately not stored,
+    only its fingerprint. An unknown verdict, memory id or hash is a 400.
+    """
+    memory_id = check_memory_id(memory_id)
+    verdict = check_verdict(verdict)
+    digest = check_text_hash(text_hash)
+    at = now or datetime.now(timezone.utc)
+    if at.tzinfo is None:
+        at = at.replace(tzinfo=timezone.utc)
+    out = dict(decisions) if isinstance(decisions, dict) else {}
+    out[memory_id] = {"verdict": verdict, "at": at.isoformat(), "hash": digest}
+    return out
+
+
+def decision_counts(decisions):
+    """Count a ledger by verdict, always carrying the three keys in order."""
+    counts = {verdict: 0 for verdict in VERDICTS}
+    if isinstance(decisions, dict):
+        for decision in decisions.values():
+            if isinstance(decision, dict) and decision.get("verdict") in counts:
+                counts[decision["verdict"]] += 1
+    return counts
+
+
+def prune_decisions(decisions, limit=None):
+    """Bound a ledger at ``limit`` (``MAX_DECISIONS``) entries, dropping the oldest.
+
+    Ordering is by the decision's ``at``; a missing or unparseable timestamp sorts
+    as the oldest, so junk is what gets pruned first. Returns a new mapping.
+    """
+    limit = MAX_DECISIONS if limit is None else limit
+    entry = {
+        key: value
+        for key, value in (decisions.items() if isinstance(decisions, dict) else ())
+        if isinstance(key, str) and isinstance(value, dict)
+    }
+    if len(entry) <= limit:
+        return entry
+
+    def newest_first(pair):
+        at = _parse_iso(pair[1].get("at"))
+        return (at.timestamp(), 0) if at is not None else (0.0, -1)
+
+    keep = sorted(entry.items(), key=newest_first, reverse=True)[:max(0, limit)]
+    return dict(keep)
+

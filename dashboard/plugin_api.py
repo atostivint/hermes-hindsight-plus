@@ -15,8 +15,11 @@ limit.
 from __future__ import annotations
 
 import importlib.util
+import json
+import os
 import pathlib
 import sys
+import tempfile
 import threading
 from typing import Annotated
 
@@ -91,6 +94,67 @@ def _review_client():
     return _review().ReviewClient(api_url, api_key)
 
 
+# --- local review ledger --------------------------------------------------------
+# ``review-decisions.json`` in the plugin data dir, one JSON object per bank:
+# ``{"<bank>": {"<memory_id>": {"verdict", "at", "hash"}}}``. It is local
+# bookkeeping only: no fact text, no key, no HTTP request, and never written to
+# Hindsight. ``review.py`` owns the pure decision helpers; the file lives here.
+
+DECISIONS_FILENAME = "review-decisions.json"
+_decisions_lock = threading.Lock()
+
+
+def _decisions_path():
+    # core exposes no public alias: ``_plugin_data_dir`` is its resolver.
+    return pathlib.Path(_core()._plugin_data_dir()) / DECISIONS_FILENAME
+
+
+def _read_decisions():
+    """Return the whole ledger; a missing, corrupt or non-object file reads empty.
+
+    Fail open: a ledger the plugin cannot understand must never break the page or
+    turn into a 500, the facts simply stay in the review queue.
+    """
+    try:
+        with open(_decisions_path(), "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _bank_decisions(ledger, bank):
+    """One bank's entry, ignoring anything that is not a decision object."""
+    entry = ledger.get(bank) if isinstance(ledger, dict) else None
+    if not isinstance(entry, dict):
+        return {}
+    return {
+        key: value for key, value in entry.items()
+        if isinstance(key, str) and isinstance(value, dict)
+    }
+
+
+def _write_decisions(ledger):
+    """Write the ledger atomically: temp file in the same dir, then ``os.replace``."""
+    path = _decisions_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(
+        dir=str(path.parent), prefix=path.name + ".", suffix=".tmp"
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(ledger, handle, ensure_ascii=False, sort_keys=True)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_name, path)
+    except BaseException:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+
+
 def _review_call(fn, *args, **kwargs):
     review = _review()
     try:
@@ -106,18 +170,88 @@ def _review_call(fn, *args, **kwargs):
 @router.get("/review/{bank}/memories")
 def review_list(
     bank: str,
-    limit: int = Query(100, ge=1, le=200),
+    limit: int = Query(100, ge=1),
     offset: int = Query(0, ge=0),
     state: str = Query("valid", max_length=16),
     sort: str = Query("staleness", max_length=16),
     q: str = Query("", max_length=200),
+    review_only: bool = Query(False),
 ):
-    """List a bank's facts with ``age_score`` and ``volatile_score``, sorted."""
-    return _review_call(
-        lambda: _review().list_review(
-            _review_client(), bank, limit=limit, offset=offset, state=state, sort=sort, q=q
+    """Rank a bank's facts across the whole bank (``age``/``volatile``/``staleness``).
+
+    ``items`` is the ``offset..offset + limit`` slice of the globally sorted set;
+    ``scanned``, ``truncated``, ``matched`` and ``to_review`` describe the scan.
+    ``matched`` is the post-filter count and ``to_review`` the queue size after the
+    local ledger, not a ``q`` match count. ``limit`` is capped at
+    ``review.MAX_PAGE``, read at call time (see ``run``).
+    """
+    def run():
+        review = _review()
+        # The page ceiling is read here, not at import: a request cap and a backend
+        # cap that drift apart would become a 400 the page cannot explain, and a
+        # broken ``review.py`` must cost this route rather than the whole API.
+        if not 1 <= limit <= review.MAX_PAGE:
+            raise review.ReviewError(400, f"limit must be 1..{review.MAX_PAGE}")
+        with _decisions_lock:
+            decisions = _bank_decisions(_read_decisions(), bank)
+        return review.list_review(
+            _review_client(), bank, limit=limit, offset=offset, state=state, sort=sort,
+            q=q, review_only=review_only, decisions=decisions,
         )
-    )
+
+    return _review_call(run)
+
+
+@router.get("/review/{bank}/decisions")
+def review_decisions(bank: str):
+    """Return one bank's local review ledger: verdict counts and the total.
+
+    Read-only, local, and no Hindsight request: the ledger is the user's own
+    record of what they already checked.
+    """
+    def run():
+        review = _review()
+        review.check_bank(bank)
+        with _decisions_lock:
+            entry = _bank_decisions(_read_decisions(), bank)
+        return {"bank": bank, "counts": review.decision_counts(entry), "total": len(entry)}
+
+    return _review_call(run)
+
+
+@router.post("/review/{bank}/decisions")
+def review_record_decision(bank: str, payload: Annotated[dict | None, Body()] = None):
+    """Record one user decision for a fact: ``still true``, ``outdated`` or ``cannot tell``.
+
+    The ledger is local bookkeeping only: nothing is sent to Hindsight and no request
+    here checks that the fact exists upstream. The id is validated syntactically
+    (``review.check_memory_id``) and the ``hash`` comes from the client, pinning the
+    entry to the text the user actually saw -- a wrong hash is accepted and simply
+    never hides the fact, so it stays in the queue. The ledger is bounded
+    (``review.MAX_DECISIONS`` per bank) and the fact's text is never stored.
+    """
+    def run():
+        review = _review()
+        review.check_bank(bank)
+        data = payload or {}
+        with _decisions_lock:
+            ledger = _read_decisions()
+            entry = review.record_decision(
+                _bank_decisions(ledger, bank),
+                data.get("id"),
+                data.get("verdict"),
+                data.get("hash"),
+            )
+            entry = review.prune_decisions(entry)
+            ledger = dict(ledger)
+            ledger[bank] = entry
+            _write_decisions(ledger)
+        return {
+            "decision": entry.get(str(data.get("id") or "")),
+            "counts": review.decision_counts(entry),
+        }
+
+    return _review_call(run)
 
 
 @router.post("/review/{bank}/memories/{memory_id}/revoke")

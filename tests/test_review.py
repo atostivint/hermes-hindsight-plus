@@ -5,6 +5,7 @@ import socketserver
 import sys
 import threading
 import types
+import urllib.parse
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
@@ -268,7 +269,9 @@ def test_list_review_scores_sorts_and_sends_bearer(review, client, stub):
     req = stub.requests[0]
     assert req["method"] == "GET"
     assert "/v1/default/banks/hermes/memories/list" in req["path"]
-    assert "limit=50" in req["path"] and "state=valid" in req["path"]
+    # The upstream page size is the scan window, not the display ``limit``: the
+    # ranking has to see the whole bank before ``limit`` slices it.
+    assert f"limit={review.MAX_PAGE}" in req["path"] and "state=valid" in req["path"]
     assert req["auth"] == "Bearer " + SECRET
     assert SECRET not in json.dumps(result)
 
@@ -555,3 +558,293 @@ def test_dashboard_review_routes_end_to_end(stub, monkeypatch, tmp_path):
     finally:
         for name in ("hermes_hindsight_plus_dashboard_core", "hermes_hindsight_plus_dashboard_review"):
             sys.modules.pop(name, None)
+
+
+# --- global ranking / work queue -----------------------------------------------
+
+
+class QueueHindsight:
+    """A paging-aware stub: honours ``limit``/``offset`` and records every request."""
+
+    def __init__(self, facts, total=None, ignore_offset=False, report_total=True,
+                 page_cap=None):
+        self.facts = list(facts)
+        self.total = total                  # override the reported total when not None
+        self.ignore_offset = ignore_offset  # a server that never advances past page 1
+        self.report_total = report_total    # a server that omits `total` entirely
+        self.page_cap = page_cap            # a server that ignores `limit` downwards
+        self.requests = []
+        outer = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def _send(self, status, payload):
+                body = json.dumps(payload).encode()
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_GET(self):
+                outer.requests.append({
+                    "method": self.command, "path": self.path,
+                    "auth": self.headers.get("Authorization"),
+                })
+                parsed = urllib.parse.urlparse(self.path)
+                if not parsed.path.endswith("/memories/list"):
+                    return self._send(404, {"detail": "not found"})
+                query = urllib.parse.parse_qs(parsed.query)
+                limit = int(query.get("limit", ["100"])[0])
+                if outer.page_cap is not None:
+                    limit = min(limit, outer.page_cap)
+                offset = 0 if outer.ignore_offset else int(query.get("offset", ["0"])[0])
+                page = outer.facts[offset:offset + limit]
+                payload = {"items": page, "limit": limit, "offset": offset}
+                if outer.report_total:
+                    total = len(outer.facts) if outer.total is None else outer.total
+                    payload["total"] = total
+                self._send(200, payload)
+
+        self.server = _QuickHTTPServer(("127.0.0.1", 0), Handler)
+        self.url = f"http://127.0.0.1:{self.server.server_port}"
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+
+    def close(self):
+        self.server.shutdown()
+        self.server.server_close()
+
+
+def _fact(mid, days, text="plain note"):
+    return {"id": mid, "text": text, "state": "valid", "fact_type": "world",
+            "date": _iso(days), "invalidation_reason": None}
+
+
+@pytest.fixture()
+def queue(review):
+    """Build a paging stub and a client pointed at it; both are closed after the test."""
+    servers = []
+
+    def build(facts, **kwargs):
+        stub = QueueHindsight(facts, **kwargs)
+        servers.append(stub)
+        return stub, review.ReviewClient(stub.url, SECRET, timeout_s=5)
+
+    yield build
+    for stub in servers:
+        stub.close()
+
+
+def test_global_sort_ranks_a_stale_fact_from_the_second_upstream_page_first(review, queue):
+    facts = [_fact(f"f{i}", 1) for i in range(review.MAX_PAGE)]
+    facts.append(_fact("old", 400))  # only reachable on the second upstream page
+    stub, client = queue(facts)
+
+    result = review.list_review(client, "hermes", now=NOW)
+
+    assert result["items"][0]["id"] == "old"
+    assert result["total"] == review.MAX_PAGE + 1
+    assert result["scanned"] == review.MAX_PAGE + 1
+    assert result["truncated"] is False
+    assert len(stub.requests) == 2
+    assert f"limit={review.MAX_PAGE}" in stub.requests[0]["path"]
+    assert "offset=200" in stub.requests[1]["path"]
+
+
+def test_review_only_filters_staleness_zero_and_counters_agree(review, queue):
+    facts = [
+        _fact("fresh", 0),
+        _fact("old", 400),
+        _fact("volatile", 0, "host is 10.0.0.5"),
+    ]
+    _stub, client = queue(facts)
+
+    everything = review.list_review(client, "hermes", now=NOW)
+    assert everything["matched"] == 3
+    assert everything["to_review"] == 2
+    assert {i["id"] for i in everything["items"]} == {"fresh", "old", "volatile"}
+
+    queued = review.list_review(client, "hermes", now=NOW, review_only=True)
+    assert [i["id"] for i in queued["items"]] == ["old", "volatile"]
+    assert queued["matched"] == queued["to_review"] == len(queued["items"]) == 2
+    assert queued["scanned"] == 3
+    assert all(i["staleness"] > 0 for i in queued["items"])
+
+
+def test_needs_review_requires_a_strictly_positive_staleness(review):
+    """``staleness > 0`` is the rule; a negative score is not a stale fact.
+
+    The item is built by hand (no HTTP): ``score_item`` never returns a negative
+    staleness, so this pins the predicate itself.
+    """
+    assert review.needs_review({"id": "m1", "staleness": -5}) is False
+    assert review.needs_review({"id": "m1", "staleness": -0.1}) is False
+    assert review.needs_review({"id": "m1", "staleness": 0}) is False
+    assert review.needs_review({"id": "m1"}) is False
+    assert review.needs_review({"id": "m1", "staleness": 0.5}) is True
+    # a negative score stays out of the queue even with an empty ledger
+    assert review.needs_review({"id": "m1", "staleness": -5}, {}, NOW) is False
+
+
+def test_truncated_when_the_bank_exceeds_max_scan(review, queue, monkeypatch):
+    monkeypatch.setattr(review, "MAX_SCAN", 5)
+    facts = [_fact(f"f{i}", 10 + i) for i in range(8)]
+    stub, client = queue(facts)
+
+    result = review.list_review(client, "hermes", now=NOW)
+
+    assert result["scanned"] == 5
+    assert result["truncated"] is True
+    assert result["total"] == 8
+    assert result["matched"] == 5
+    assert len(stub.requests) == 1  # one bounded page, never a request past the window
+    assert "limit=5" in stub.requests[0]["path"]
+
+
+def test_offset_slices_the_ranked_set_not_the_upstream_page(review, queue):
+    facts = [
+        _fact("fresh", 0),  # first upstream, filtered out by review_only
+        _fact("a", 400),
+        _fact("b", 300),
+        _fact("c", 200),
+        _fact("d", 100),
+    ]
+    stub, client = queue(facts)
+
+    page = review.list_review(client, "hermes", limit=2, offset=1, now=NOW, review_only=True)
+
+    assert page["matched"] == 4
+    assert [i["id"] for i in page["items"]] == ["b", "c"]  # raw slice would be a,b
+    assert page["offset"] == 1 and page["limit"] == 2
+    assert "offset=0" in stub.requests[0]["path"]  # the scan starts at the top of the bank
+
+
+def test_q_is_forwarded_upstream_and_never_filtered_here(review, queue):
+    facts = [_fact("a", 10, "postgres on the nas"), _fact("b", 20, "unrelated")]
+    stub, client = queue(facts)
+
+    result = review.list_review(client, "hermes", q="  postgres  ", now=NOW)
+
+    assert "q=postgres" in stub.requests[0]["path"]
+    assert "state=valid" in stub.requests[0]["path"]
+    assert result["scanned"] == 2  # the stub ignores q: filtering is Hindsight's job
+    assert len(result["items"]) == 2
+
+
+def test_list_review_response_keys_match_the_contract(review, queue):
+    _stub, client = queue([_fact("a", 10)])
+    result = review.list_review(client, "hermes", now=NOW)
+    assert list(result) == [
+        "bank", "total", "scanned", "truncated", "matched", "to_review",
+        "offset", "limit", "sort", "items",
+    ]
+    assert result["scanned"] == 1 and result["truncated"] is False
+    assert result["matched"] == 1 and result["to_review"] == 1
+
+
+def test_scan_terminates_on_a_server_that_ignores_offset(review, queue):
+    facts = [_fact(f"f{i}", i) for i in range(review.MAX_PAGE + 5)]
+    stub, client = queue(facts, ignore_offset=True)
+
+    result = review.list_review(client, "hermes", now=NOW)
+
+    assert result["scanned"] == review.MAX_PAGE
+    assert len(stub.requests) == 2  # the repeated page brought no new id: stop
+    assert len(result["items"]) == 100
+    # 205 facts exist, only 200 were read: the early stop is reported, not hidden.
+    assert result["total"] == 205
+    assert result["truncated"] is True
+
+
+@pytest.mark.parametrize(
+    "facts,total,report_total,expected",
+    [
+        (0, 1999, True, False),   # the bank fits the window exactly
+        (0, 2000, True, False),   # exactly MAX_SCAN: nothing was cut
+        (0, 2500, True, True),    # the window cut a larger bank
+        (0, None, False, True),   # no total and a full window: assume it was cut
+    ],
+    ids=["fits", "exact-window", "window-cut", "no-total-full-window"],
+)
+def test_truncated_boundaries(review, queue, facts, total, report_total, expected):
+    count = total if report_total else review.MAX_SCAN
+    rows = [_fact(f"f{i}", 10) for i in range(count)]
+    _stub, client = queue(rows, total=total, report_total=report_total)
+
+    result = review.list_review(client, "hermes", now=NOW)
+
+    assert result["scanned"] == min(count, review.MAX_SCAN)
+    assert result["truncated"] is expected
+    if report_total:
+        assert result["total"] == total
+
+
+def test_truncated_when_the_server_ignores_offset_and_ignores_the_size_it_reports(review, queue):
+    # The upstream total says 205, offset is ignored: 200 rows read, 205 claimed.
+    facts = [_fact(f"f{i}", 10) for i in range(205)]
+    stub, client = queue(facts, ignore_offset=True)
+
+    result = review.list_review(client, "hermes", now=NOW)
+
+    assert result["scanned"] == 200 and result["total"] == 205
+    assert result["truncated"] is True
+    assert len(stub.requests) == 2
+
+
+def test_non_numeric_total_does_not_mark_a_full_window_as_truncated(review, queue, monkeypatch):
+    monkeypatch.setattr(review, "MAX_SCAN", 5)
+    facts = [_fact(f"f{i}", 10) for i in range(5)]
+    _stub, client = queue(facts, total="5")
+
+    result = review.list_review(client, "hermes", now=NOW)
+
+    assert result["scanned"] == 5
+    assert result["total"] == "5"  # the raw value is what the response carries
+    assert result["truncated"] is False  # the string total was coerced, not dropped
+
+
+def test_a_total_that_cannot_be_coerced_is_treated_as_absent(review, queue, monkeypatch):
+    monkeypatch.setattr(review, "MAX_SCAN", 5)
+    facts = [_fact(f"f{i}", 10) for i in range(5)]
+    _stub, client = queue(facts, total="many")
+
+    result = review.list_review(client, "hermes", now=NOW)
+
+    assert result["scanned"] == 5 and result["total"] == "many"
+    assert result["truncated"] is True  # no usable total + full window: assume cut
+
+
+def test_scan_stops_at_max_calls_against_a_one_row_per_page_server(review, queue):
+    facts = [_fact(f"f{i}", 10) for i in range(400)]
+    stub, client = queue(facts, page_cap=1)
+
+    result = review.list_review(client, "hermes", now=NOW)
+
+    assert review.MAX_CALLS == 4 * -(-review.MAX_SCAN // review.MAX_PAGE)
+    assert len(stub.requests) <= review.MAX_CALLS
+    assert len(stub.requests) == review.MAX_CALLS
+    assert result["scanned"] == review.MAX_CALLS
+    assert result["truncated"] is True  # 400 facts exist, MAX_CALLS were read
+
+
+def test_facts_without_an_id_are_skipped_instead_of_collapsed_into_one(review, queue):
+    facts = [
+        {"id": "", "text": "no id one", "date": _iso(400), "fact_type": "world"},
+        {"id": "", "text": "no id two", "date": _iso(400), "fact_type": "world"},
+        {"id": "", "text": "no id three", "date": _iso(400), "fact_type": "world"},
+        _fact("kept", 400),
+    ]
+    stub, client = queue(facts)
+
+    result = review.list_review(client, "hermes", now=NOW)
+
+    # An id-less fact can be neither curated nor deduplicated: it is not scored at
+    # all, and it must not make its siblings vanish either.
+    assert result["scanned"] == 1
+    assert [item["id"] for item in result["items"]] == ["kept"]
+    assert result["total"] == 4
+    assert len(stub.requests) == 2  # the page was not mistaken for a repeat
+
