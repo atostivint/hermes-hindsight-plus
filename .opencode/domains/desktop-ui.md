@@ -37,6 +37,9 @@
 ## Known traps
 - There is no JS test harness: `node --check` proves syntax only. Any rendering, layout, selection or
   dialog behaviour is a **gap** until the user looks at it in Hermes Desktop.
+- Card mode revokes with `reason: 'outdated: '` - `review.check_reason` only accepts a
+  `"superseded by "` or `"outdated: "` prefix, so any other wording makes every "Faux" click a
+  silent HTTP 400 (measured 2026-11-11: the card never advanced and nothing was recorded).
 - The review header counts are PAGE-scoped: the list is fetched with `limit=100&offset=…`, so the
   numerator is the page size and the "à revoir" count is computed on the displayed set only. The
   server's real total (`query.data.total`, `review.py:266`) is only in the footer. A label that

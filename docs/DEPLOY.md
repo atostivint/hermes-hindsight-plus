@@ -14,9 +14,10 @@ the trap below).
 hermes plugins install https://github.com/atostivint/hermes-hindsight-plus.git --force --yes-deps --enable
 ```
 
-This clones the repo, copies the agent half, reloads the gateway plugins, and publishes the
-desktop half. It is the only mechanism that works on both real hosts (Linux `oracle`, this
-Windows machine).
+This clones the repo, copies the agent half, reloads the gateway's plugin hooks (see
+[New HTTP routes need a restart](#new-http-routes-need-a-restart)), and publishes the desktop
+half. It is the only mechanism that works on both real hosts (Linux `oracle`, this Windows
+machine).
 
 ## New version
 
@@ -27,6 +28,38 @@ Same command: `hermes plugins install <git url> --force --yes-deps --enable`. Us
 Do **not** use `hermes plugins update <name> --yes` (`--yes` is only valid with no name). And
 `hermes plugins update <name>` answers "already up to date" when the clone already tracks
 `origin/main`, without refreshing the desktop half.
+
+## New HTTP routes need a restart
+
+`hermes plugins install` reloads the plugin **hooks** in the running gateway — the install says
+so itself ("active in the running gateway now: hooks"). It does **not** rebuild the
+dashboard/HTTP **route table**: that table is built when the process serving the plugin API
+starts. A version that adds a route therefore answers, on that route,
+
+```
+404 {"detail":"Not Found"}
+```
+
+while the routes that already existed keep working. Measured on 2026-11-11 with v0.6.0: the
+install was clean, the list route was fine, and the new card route 404'd on the first click.
+The code was correct and installed; the server had not been restarted.
+
+Two cases:
+
+* **Desktop app on Windows** — the app serves the plugin API itself (`hermes serve --status`
+  reports no dashboard/serve process). Quit it completely, tray icon included, then relaunch
+  it. `scripts/deploy.ps1` prints this step and never does it for you: that window is yours.
+* **Headless host** (`hermes serve` / `hermes dashboard`, e.g. `oracle`) — restart it:
+  `hermes serve --stop`, then start it again (or let the app start it).
+
+`pwsh -File scripts/deploy.ps1 -Target all -RestartApi` handles the headless case: it asks
+`hermes serve --status` on each host, stops and restarts `hermes serve` only when a process is
+listed, and does nothing when none is. It never touches the Desktop app and never kills a
+process by name.
+
+How to tell this apart from a routing bug: the route exists in the code and in the installed
+package, older routes on the same router answer, the new one is the only 404 — and a restart
+makes it answer.
 
 ## The `.hermes-package.json` trap
 

@@ -159,7 +159,10 @@ to the cache or injects nothing — it never raises.
 refreshes the agent half under `<HERMES_HOME>` and reloads the gateway plugins; the desktop half
 is only refreshed when Hermes can prove the published copy is its own. When it is stale,
 `pwsh -File scripts/deploy.ps1 -Target all` (`-DryRun` to preview) repairs and re-checks it —
-see [docs/DEPLOY.md](docs/DEPLOY.md) for the `.hermes-package.json` trap.
+see [docs/DEPLOY.md](docs/DEPLOY.md) for the `.hermes-package.json` trap. A version that adds
+an HTTP route also needs the API host restarted (relaunch the Desktop app, or
+`hermes serve --stop`) — see
+[docs/DEPLOY.md#new-http-routes-need-a-restart](docs/DEPLOY.md#new-http-routes-need-a-restart).
 
 The plugin reads the Hindsight endpoint from `$HERMES_HOME/hindsight/config.json`
 (`api_url`, `bank_id`, and optionally `api_key`). If those are absent it falls back to the
