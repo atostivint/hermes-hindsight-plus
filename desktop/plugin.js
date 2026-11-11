@@ -1271,7 +1271,8 @@ function MemoryReviewPage() {
         String(i.text || '').toLowerCase().includes(q) ||
         String(i.context || '').toLowerCase().includes(q))
     : items
-  const toReview = items.filter(i => (i.staleness || 0) > 0).length
+  const stale = filtered.filter(i => (i.staleness || 0) > 0).length
+  const total = formatNumber(query.data?.total ?? items.length)
 
   // group by theme
   const groups = new Map()
@@ -1312,7 +1313,11 @@ function MemoryReviewPage() {
             placeholder: 'Rechercher (texte, contexte)',
             onChange: e => setSearch(e.target.value)
           }),
-          jsx('span', { style: styles.footerText, children: `${filtered.length} souvenirs sur ${toReview} a revoir` }),
+          jsx('span', {
+            style: styles.footerText,
+            title: 'Le compte "à revoir" porte sur les souvenirs affichés (score de staleness supérieur à zéro), pas sur toute la banque.',
+            children: `${filtered.length} / ${total} souvenirs · ${stale} à revoir sur cette page`
+          }),
           jsx(Button, {
             type: 'button', size: 'xs', variant: 'secondary',
             disabled: busy || picked.length === 0 || picked.length > REVIEW_MAX_CHECK,
