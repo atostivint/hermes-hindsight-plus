@@ -23,7 +23,6 @@ import {
   ROUTES_AREA,
   SIDEBAR_NAV_AREA,
   ScrollArea,
-  SegmentedControl,
   Streamdown,
   Textarea,
   atom,
@@ -858,9 +857,24 @@ function collectStrings(value, out = []) {
   return out
 }
 
-function ReviewRow({ item, checked, onCheck, onAction, verdict }) {
+function ReviewRow({
+  item,
+  checked,
+  onCheck,
+  onAction,
+  verdict,
+  editing,
+  editText,
+  onEditText,
+  onSaveEdit,
+  onCancelEdit,
+  onStartEdit
+}) {
   const volatile = item.volatile_hits.length ? item.volatile_hits.join(', ') : 'none'
   const invalid = item.state === 'invalidated'
+  const provenance = item.date
+    ? `${item.date}${item.context ? ' · ' + item.context : ''}`
+    : (item.context ? item.context : 'source inconnue')
   return jsxs('section', {
     style: { ...rv.row, opacity: invalid ? 0.7 : 1 },
     children: [
@@ -874,7 +888,44 @@ function ReviewRow({ item, checked, onCheck, onAction, verdict }) {
       jsxs('div', {
         style: { display: 'grid', gap: 6, minWidth: 0 },
         children: [
-          jsx('div', { style: rv.text, children: item.text }),
+          editing
+            ? jsxs('div', {
+                style: { display: 'grid', gap: 6 },
+                children: [
+                  jsx('textarea', {
+                    style: rv.textarea,
+                    value: editText,
+                    autoFocus: true,
+                    onChange: e => onEditText(e.target.value),
+                    onKeyDown: e => {
+                      if (e.key === 'Escape') {
+                        e.preventDefault()
+                        onCancelEdit()
+                      } else if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
+                        e.preventDefault()
+                        onSaveEdit()
+                      }
+                    }
+                  }),
+                  jsxs('div', {
+                    style: rv.actions,
+                    children: [
+                      jsx(Button, { type: 'button', size: 'xs', variant: 'primary', onClick: () => onSaveEdit(), children: 'Enregistrer' }),
+                      jsx(Button, { type: 'button', size: 'xs', variant: 'ghost', onClick: () => onCancelEdit(), children: 'Annuler' })
+                    ]
+                  })
+                ]
+              })
+            : jsx('div', {
+                style: { ...rv.text, cursor: item.curatable ? 'pointer' : 'default' },
+                onClick: () => { if (item.curatable) onStartEdit(item) },
+                title: item.curatable ? 'Cliquer pour editer' : '',
+                children: item.text
+              }),
+          jsx('div', {
+            style: { fontSize: 10, color: 'var(--ui-text-tertiary)', overflowWrap: 'anywhere' },
+            children: provenance
+          }),
           jsxs('div', {
             style: rv.actions,
             children: [
@@ -907,8 +958,7 @@ function ReviewRow({ item, checked, onCheck, onAction, verdict }) {
                     children: [
                       invalid
                         ? jsx(Button, { type: 'button', size: 'xs', variant: 'secondary', onClick: () => onAction('restore', item), children: 'Restore' })
-                        : jsx(Button, { type: 'button', size: 'xs', variant: 'secondary', onClick: () => onAction('revoke', item), children: 'Revoke' }),
-                      jsx(Button, { type: 'button', size: 'xs', variant: 'ghost', onClick: () => onAction('update', item), children: 'Edit' })
+                        : jsx(Button, { type: 'button', size: 'xs', variant: 'secondary', onClick: () => onAction('revoke', item), children: 'Revoke' })
                     ]
                   })
                 : jsx(Badge, { size: 'xs', variant: 'muted', children: 'derived' })
@@ -1010,6 +1060,34 @@ async function startHermesCheck(bank, facts) {
   }
 }
 
+const THEME_KEYS = [
+  ['sante', 'Sante', ['sante', 'medecin', 'sommeil', 'traitement']],
+  ['famille', 'Famille', ['ex-femme', 'parents', 'grand-mere', 'divorce']],
+  ['argent', 'Argent', ['ynab', 'budget', 'salaire', 'banque', 'impots']],
+  ['emploi', 'Emploi', ['emploi', 'cv', 'linkedin', 'entretien', 'recruteur', 'atlas']],
+  ['infra', 'Infra', ['homelab', 'proxmox', 'oracle', 'zenith', 'zenon', 'kubernetes', 'ansible', 'tailscale', 'docker', 'dns', 'hermes', 'gateway']],
+  ['projets', 'Projets', ['projet', 'plugin', 'hindsight', 'kanban', 'paseo', 'tronic', 'busybar', 'memoire']],
+  ['preferences', 'Preferences', ['prefere', 'preference', 'aime', 'style', 'ton', 'langue', 'francais', 'falc']]
+]
+const ALLOWED_TAGS = new Set(['identite', 'travail', 'sante', 'famille', 'argent', 'preferences', 'projets', 'infra'])
+
+function themeOf(item) {
+  const tags = Array.isArray(item && item.tags) ? item.tags : []
+  for (const t of tags) {
+    const tag = String(t || '').trim().toLowerCase()
+    if (ALLOWED_TAGS.has(tag)) {
+      return tag.charAt(0).toUpperCase() + tag.slice(1)
+    }
+  }
+  const haystack = (String((item && item.text) || '') + ' ' + String((item && item.context) || '')).toLowerCase()
+  for (const [, label, words] of THEME_KEYS) {
+    if (words.some(w => haystack.includes(w))) return label
+  }
+  if (haystack.includes('travail')) return 'Emploi'
+  if (haystack.includes('identite')) return 'Identite'
+  return 'General'
+}
+
 function MemoryReviewPage() {
   const [bank, setBank] = useState('hermes')
   const [state, setState] = useState('valid')
@@ -1023,13 +1101,13 @@ function MemoryReviewPage() {
   const [pasted, setPasted] = useState('')
   const [busy, setBusy] = useState(false)
   const [notice, setNotice] = useState('')
-  const [view, setView] = useState('list')
-  const [docText, setDocText] = useState('')
-  const [docBase, setDocBase] = useState([])
   const [showAdd, setShowAdd] = useState(false)
   const [newContent, setNewContent] = useState('')
   const [newContext, setNewContext] = useState('')
   const [newTags, setNewTags] = useState('')
+  const [search, setSearch] = useState('')
+  const [editingId, setEditingId] = useState(null)
+  const [editText, setEditText] = useState('')
   const queryClient = useQueryClient()
   const key = [ID, 'review', bank, state, offset]
 
@@ -1041,16 +1119,7 @@ function MemoryReviewPage() {
     retry: 1
   })
 
-  const docQuery = useQuery({
-    queryKey: [ID, 'review', bank, 'valid', 0, 'document'],
-    queryFn: () =>
-      reviewCall(`/review/${bank}/memories?limit=100&offset=0&state=valid&sort=staleness`),
-    staleTime: 10000,
-    retry: 1
-  })
-
   const items = sortReview(Array.isArray(query.data?.items) ? query.data.items : [], sort)
-  const docItems = sortReview(Array.isArray(docQuery.data?.items) ? docQuery.data.items : [], sort)
   const picked = items.filter(i => selected[i.id])
   const refresh = () => void queryClient.invalidateQueries({ queryKey: [ID, 'review'] })
 
@@ -1086,13 +1155,6 @@ function MemoryReviewPage() {
       setBusy(false)
     }
   }
-
-  useEffect(() => {
-    if (view !== 'document') return
-    const facts = docItems.length ? docItems : docQuery.data?.items || []
-    setDocBase(facts)
-    setDocText((facts || []).map(item => item.text || '').join('\\n'))
-  }, [view, docQuery.data])
 
   const onCheck = (id, on) => {
     const count = Object.values(selected).filter(Boolean).length
@@ -1135,7 +1197,7 @@ function MemoryReviewPage() {
           : 'Could not start the chat directly; the prompt is in a new chat composer. Press Enter there.'
       )
     } catch (error) {
-      setNotice(`Could not start the check: ${String(error.message || error)}`)
+      setNotice(`Could not start the check: ${String(error && error.message ? error.message : error)}`)
     } finally {
       setBusy(false)
     }
@@ -1158,100 +1220,38 @@ function MemoryReviewPage() {
           : 'No verdict block found yet. Paste the agent reply below, or try again later.'
       )
     } catch (error) {
-      setNotice(`Could not read verdicts: ${String(error.message || error)}`)
+      setNotice(`Could not read verdicts: ${String(error && error.message ? error.message : error)}`)
     } finally {
       setBusy(false)
     }
   }
 
-  const docLines = docText === '' ? [] : docText.split('\\n').filter(line => line.trim() !== '')
-  const docOriginalIds = docBase.map(item => item.id)
-  const docOriginalTexts = docBase.map(item => item.text || '')
-
-  const lcsPairs = (() => {
-    const m = docOriginalTexts.length
-    const n = docLines.length
-    const dp = Array.from({ length: m + 1 }, () => Array(n + 1).fill(0))
-    for (let i = m - 1; i >= 0; i -= 1) {
-      for (let j = n - 1; j >= 0; j -= 1) {
-        if (docOriginalTexts[i] === docLines[j]) dp[i][j] = 1 + dp[i + 1][j + 1]
-        else dp[i][j] = Math.max(dp[i + 1][j], dp[i][j + 1])
-      }
-    }
-    const pairs = []
-    let i = 0
-    let j = 0
-    while (i < m && j < n) {
-      if (docOriginalTexts[i] === docLines[j]) {
-        pairs.push([i, j])
-        i += 1
-        j += 1
-      } else if (dp[i + 1][j] >= dp[i][j + 1]) {
-        i += 1
-      } else {
-        j += 1
-      }
-    }
-    return pairs
-  })()
-
-  let docModified = 0
-  let docRemoved = 0
-  let docAdded = 0
-  const docUpdates = []
-  const docRemovals = []
-  let oi = 0
-  let ci = 0
-  for (const [mo, mc] of [...lcsPairs, [docOriginalTexts.length, docLines.length]]) {
-    const removedChunk = docOriginalTexts.slice(oi, mo)
-    const removedIds = docOriginalIds.slice(oi, mo)
-    const addedChunk = docLines.slice(ci, mc)
-    const paired = Math.min(removedChunk.length, addedChunk.length)
-    for (let k = 0; k < paired; k += 1) {
-      if (removedChunk[k] !== addedChunk[k]) {
-        docModified += 1
-        docUpdates.push({ id: removedIds[k], text: addedChunk[k] })
-      }
-    }
-    for (let k = paired; k < removedChunk.length; k += 1) {
-      docRemoved += 1
-      docRemovals.push({ id: removedIds[k], state: 'invalidated', reason: 'removed in document editor' })
-    }
-    docAdded += Math.max(0, addedChunk.length - removedChunk.length)
-    if (mo < docOriginalTexts.length && mc < docLines.length) {
-      oi = mo + 1
-      ci = mc + 1
-    } else {
-      oi = mo
-      ci = mc
-    }
+  const startEdit = item => {
+    setEditingId(item.id)
+    setEditText(item.text || '')
   }
-
-  const applyDocument = async () => {
-    const ops = [...docUpdates, ...docRemovals]
-    if (ops.length === 0) {
-      setNotice(docAdded > 0
-        ? 'Added lines are not created: no new memory is ever written.'
-        : 'No changes to apply.')
-      return
-    }
+  const cancelEdit = () => {
+    setEditingId(null)
+    setEditText('')
+  }
+  const saveEdit = async () => {
+    if (editingId == null) return
+    const item = items.find(i => i.id === editingId)
+    if (!item) { cancelEdit(); return }
+    const text = editText.trim()
+    if (!text) { setNotice('Le texte est requis.'); return }
     setBusy(true)
     setNotice('')
     try {
-      const result = await reviewPost(`/review/${bank}/apply`, ops)
-      const okCount = Array.isArray(result?.results)
-        ? result.results.filter(item => item && item.ok).length
-        : ops.length
-      setNotice(`Applied ${okCount}/${ops.length} change(s). Added lines were not created.`)
-      void queryClient.invalidateQueries({ queryKey: [ID, 'review'] })
-      const refreshed = await docQuery.refetch()
-      const facts = Array.isArray(refreshed?.data?.items)
-        ? refreshed.data.items
-        : (Array.isArray(docQuery.data?.items) ? docQuery.data.items : [])
-      setDocBase(sortReview(facts, sort))
-      setDocText(sortReview(facts, sort).map(item => item.text || '').join('\\n'))
+      const base = `/review/${bank}/memories/${encodeURIComponent(item.id)}`
+      const result = await reviewPost(`${base}/update`, { text })
+      setLast({ kind: 'update', bank, previous: result.previous, current: result.current })
+      setNotice('Souvenir mis a jour.')
+      setEditingId(null)
+      setEditText('')
+      refresh()
     } catch (error) {
-      setNotice(`Apply failed: ${String(error && error.message ? error.message : error)}`)
+      setNotice(`Mise a jour impossible : ${String(error && error.message ? error.message : error)}`)
     } finally {
       setBusy(false)
     }
@@ -1265,63 +1265,36 @@ function MemoryReviewPage() {
       children: options.map(([v, label]) => jsx('option', { value: v, children: label }, v))
     })
 
-  if (view === 'document') {
-    return jsxs('div', {
-      style: rv.page,
-      children: [
-        jsxs('header', {
-          style: rv.bar,
-          children: [
-            jsx('div', { style: { ...styles.title, flex: 1 }, children: 'Memory review' }),
-            jsx(SegmentedControl, {
-              value: view,
-              onChange: setView,
-              options: [{ id: 'list', label: 'Liste' }, { id: 'document', label: 'Document' }]
-            }),
-            select(bank, v => { setBank(v); setOffset(0); setSelected({}) }, REVIEW_BANKS.map(b => [b, b])),
-            jsx(Button, {
-              type: 'button', size: 'icon-xs', variant: 'ghost', title: 'Refresh', 'aria-label': 'Refresh',
-              disabled: docQuery.isFetching, onClick: () => void docQuery.refetch(),
-              children: jsx(Codicon, { name: 'refresh', size: '0.8rem', spinning: docQuery.isFetching })
-            })
-          ]
-        }),
-        jsxs('div', {
-          style: { ...styles.note, margin: '8px 12px 0', display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' },
-          children: [
-            jsx('span', { style: { flex: 1 }, children: `${docLines.length} lignes · ${docModified} modifiees · ${docRemoved} supprimees` }),
-            docAdded > 0 ? jsx(Badge, { size: 'xs', variant: 'warn', children: `${docAdded} ajoutees ignorees` }) : null
-          ]
-        }),
-        docAdded > 0
-          ? jsx('div', { style: { ...styles.note, margin: '8px 12px 0' }, children: 'Les lignes ajoutees ne sont pas creees : le plugin n ecrit jamais un nouveau fait dans le banc.' })
-          : null,
-        notice
-          ? jsx('div', { style: { ...styles.note, margin: '8px 12px 0' }, children: notice })
-          : null,
-        jsx('div', {
-          style: styles.body,
-          children: jsx(Textarea, {
-            style: rv.textarea,
-            value: docText,
-            onChange: e => setDocText(e.target.value)
-          })
-        }),
-        jsxs('div', {
-          style: { padding: '8px 12px', display: 'flex', gap: 8, alignItems: 'center' },
-          children: [
-            jsx(Button, {
-              type: 'button', size: 'sm', variant: 'primary',
-              disabled: busy || (docUpdates.length === 0 && docRemovals.length === 0),
-              onClick: () => void applyDocument(),
-              children: 'Appliquer'
-            }),
-            jsx('span', { style: styles.footerText, children: docBase.length ? `${docBase.length} faits valides` : '' })
-          ]
-        })
-      ]
-    })
+  const q = search.trim().toLowerCase()
+  const filtered = q
+    ? items.filter(i =>
+        String(i.text || '').toLowerCase().includes(q) ||
+        String(i.context || '').toLowerCase().includes(q))
+    : items
+  const toReview = items.filter(i => (i.staleness || 0) > 0).length
+
+  // group by theme
+  const groups = new Map()
+  for (const it of filtered) {
+    const t = themeOf(it)
+    if (!groups.has(t)) groups.set(t, [])
+    groups.get(t).push(it)
   }
+  let finalGroups = groups
+  if (groups.size > 8) {
+    finalGroups = new Map()
+    const autres = []
+    for (const [t, its] of groups) {
+      if (t !== 'General' && its.length <= 1) autres.push(...its)
+      else finalGroups.set(t, its)
+    }
+    if (autres.length) finalGroups.set('Autres', autres)
+  }
+  const themeKeys = [...finalGroups.keys()].sort((a, b) => {
+    if (a === 'General') return 1
+    if (b === 'General') return -1
+    return String(a).localeCompare(String(b))
+  })
 
   return jsxs('div', {
     style: rv.page,
@@ -1330,14 +1303,16 @@ function MemoryReviewPage() {
         style: rv.bar,
         children: [
           jsx('div', { style: { ...styles.title, flex: 1 }, children: 'Memory review' }),
-          jsx(SegmentedControl, {
-            value: view,
-            onChange: setView,
-            options: [{ id: 'list', label: 'Liste' }, { id: 'document', label: 'Document' }]
-          }),
           select(bank, v => { setBank(v); setOffset(0); setSelected({}) }, REVIEW_BANKS.map(b => [b, b])),
           select(state, v => { setState(v); setOffset(0) }, [['valid', 'valid'], ['invalidated', 'revoked']]),
           select(sort, setSort, [['staleness', 'Sort: staleness'], ['age', 'Sort: age'], ['volatile', 'Sort: volatile']]),
+          jsx(Input, {
+            style: { ...rv.field, minWidth: 160, flex: 1 },
+            value: search,
+            placeholder: 'Rechercher (texte, contexte)',
+            onChange: e => setSearch(e.target.value)
+          }),
+          jsx('span', { style: styles.footerText, children: `${filtered.length} souvenirs sur ${toReview} a revoir` }),
           jsx(Button, {
             type: 'button', size: 'xs', variant: 'secondary',
             disabled: busy || picked.length === 0 || picked.length > REVIEW_MAX_CHECK,
@@ -1406,18 +1381,36 @@ function MemoryReviewPage() {
                   children: jsx(Button, { type: 'button', variant: 'secondary', size: 'sm', onClick: () => void query.refetch(), children: 'Try again' })
                 })
               })
-            : items.length === 0
+            : filtered.length === 0
               ? jsx('div', { style: styles.centered, children: jsx(EmptyState, { title: 'No facts here', description: 'Nothing to review in this bank and state.' }) })
               : jsx(ScrollArea, {
                   style: { flex: 1, minHeight: 0 },
                   children: jsxs('div', {
                     style: styles.list,
                     children: [
-                      ...items.map(item =>
-                        jsx(ReviewRow, {
-                          key: item.id, item, checked: Boolean(selected[item.id]), verdict: verdicts[item.id],
-                          onCheck, onAction: (kind, it) => setAction({ kind, item: it, bank })
-                        })
+                      ...themeKeys.map(theme =>
+                        jsxs('div', {
+                          key: theme,
+                          style: { display: 'grid', gap: 6 },
+                          children: [
+                            jsxs('div', {
+                              style: { fontSize: 12, fontWeight: 600, color: 'var(--ui-text-secondary)', padding: '4px 2px' },
+                              children: [theme, jsx('span', { style: { marginLeft: 6, fontSize: 10, color: 'var(--ui-text-tertiary)' }, children: `(${finalGroups.get(theme).length})` })]
+                            }),
+                            ...finalGroups.get(theme).map(item =>
+                              jsx(ReviewRow, {
+                                key: item.id, item, checked: Boolean(selected[item.id]), verdict: verdicts[item.id],
+                                editing: editingId === item.id,
+                                editText: editingId === item.id ? editText : '',
+                                onEditText: setEditText,
+                                onSaveEdit: saveEdit,
+                                onCancelEdit: cancelEdit,
+                                onStartEdit: startEdit,
+                                onCheck, onAction: (kind, it) => setAction({ kind, item: it, bank })
+                              })
+                            )
+                          ]
+                        }, theme)
                       ),
                       jsxs('div', {
                         style: rv.actions,
@@ -1442,6 +1435,7 @@ function MemoryReviewPage() {
     ]
   })
 }
+
 
 // ==== end Memory review ======================================================
 

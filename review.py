@@ -127,6 +127,7 @@ def score_item(item, now=None):
         "id": str(item.get("id") or ""),
         "text": text,
         "context": item.get("context") or "",
+        "tags": item.get("tags") if isinstance(item.get("tags"), list) else [],
         "date": date_value,
         "fact_type": fact_type,
         "state": item.get("state") or "valid",
