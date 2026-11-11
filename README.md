@@ -9,7 +9,7 @@ Inject [Hindsight](https://github.com/vectorize-io/hindsight) **mental models** 
 first turn of every Hermes Agent conversation, so each session starts with stable,
 cron-refreshed context instead of a hand-maintained `MEMORY.md` / `USER.md`.
 
-Version 0.5.0 — MIT.
+Version 0.5.1 — MIT.
 
 ## Why mental models instead of MEMORY.md / USER.md
 
@@ -132,6 +132,14 @@ to the cache or injects nothing — it never raises.
    hermes plugins enable hermes-hindsight-plus
    ```
    or by adding it to `plugins.enabled` in `config.yaml`.
+
+### Deploying a new version
+
+`hermes plugins install https://github.com/atostivint/hermes-hindsight-plus.git --force --yes-deps --enable`
+refreshes the agent half under `<HERMES_HOME>` and reloads the gateway plugins; the desktop half
+is only refreshed when Hermes can prove the published copy is its own. When it is stale,
+`pwsh -File scripts/deploy.ps1 -Target all` (`-DryRun` to preview) repairs and re-checks it —
+see [docs/DEPLOY.md](docs/DEPLOY.md) for the `.hermes-package.json` trap.
 
 The plugin reads the Hindsight endpoint from `$HERMES_HOME/hindsight/config.json`
 (`api_url`, `bank_id`, and optionally `api_key`). If those are absent it falls back to the

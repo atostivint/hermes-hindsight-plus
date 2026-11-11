@@ -88,7 +88,37 @@ machine). Relevant surfaces:
 ```bash
 python -m compileall .
 python -m pytest -q
+ruff check <each changed .py file>
+node --check desktop/plugin.js          # after any desktop/plugin.js change
+hermes plugins validate .               # after plugin.yaml / hook / desktop changes
 ```
+
+- `python -m pytest -q` is the whole suite: 97 tests, about 9 s on this machine.
+- **Do not set `PYTHONPATH` to the hermes-agent checkout for the suite.** It makes 5 tests in
+  `tests/test_plugin.py` die with `hermes_bootstrap.RelaunchExit: 1` (measured 2026-11-11). The
+  plugin imports nothing from that checkout; only the live integration needs it.
+- `ruff check .` reports ~40 pre-existing findings. Lint the files you touched, and do not reformat
+  files outside the brief.
+- There is no Rust build and no `.cargo/`/`tools/` wrapper here: a Python test run is short and
+  cannot starve the machine the way a cargo build can (see `MACHINE-AGENTS.md`). Still, do not run
+  two full suites at once for no reason.
+
+## Orchestration (one orchestrator, several workers)
+
+The working contract lives in `.orchestrator/` (`POLICY.md` is authoritative) and the per-surface
+ownership in `.opencode/domains/`. What this means for any agent working here:
+
+- **The orchestrator never edits an application file.** It triages, writes briefs, checks proofs,
+  and writes only in `.orchestrator/` and `.opencode/domains/`.
+- **One worker per independent task**, in parallel only when the files are disjoint. Shared files,
+  one task at a time: `core.py`, `plugin.yaml`, `desktop/plugin.js`, `tests/conftest.py`.
+- **Every brief is GOAL / SCOPE (exact files) / ACCEPTANCE (exact commands) / PROOF / STOP.** No file
+  outside SCOPE is touched, even to fix a typo.
+- **A proof is a diff plus commands plus outputs.** `git diff --stat`, every command with its exit
+  code, the named tests that ran, and a `gaps:` list. A report without them is rejected once, then
+  closed as failed.
+- If you run out of steps, leave the file in a working state and say exactly what is missing. Never
+  end with only a plan.
 
 ## Repo rules
 
@@ -96,3 +126,13 @@ python -m pytest -q
   `origin` = `https://github.com/atostivint/hermes-hindsight-plus`. The plugin is a work in
   progress and is **not** submitted to the Hermes plugin catalog.
 - Commit to `main` with a clear message.
+- **Do not commit, push, or publish anything without the user asking.** Read `git status`
+  first; the untracked `assets/` folder is the user's.
+- Answer in **French, short**, unless the user writes in another language. Code, code comments and
+  the README stay in English; UI copy inside the injected prompt is English and pinned by tests.
+- Work in parallel means **one agent per file**. Declare your files before editing; merge by branch,
+  never by copying files over each other.
+- Do not change an existing mental model, `MEMORY.md`/`USER.md`, or `memory.*` config, and do not
+  `DELETE` anything in Hindsight. The only writes are the ones listed in "Hard constraints".
+- Documentation ships with the change: a new setting is declared in `plugin.yaml`, used through
+  `ctx.get_config`, documented in `README.md`, and pinned by a test.
