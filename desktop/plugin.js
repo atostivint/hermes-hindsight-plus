@@ -453,13 +453,44 @@ function useHealthBank() {
   return query && query.data ? query.data.bank : null
 }
 
+const COLLAPSED_CONTENT_CHARS = 400
+
+// The pane is ~360px wide: a Markdown heading would render at heading size and
+// swallow the whole card. Demote `#`-lines to bold paragraphs for display only
+// (Copy still copies the untouched content). Fenced code is left alone, so a
+// `# comment` there keeps its own styling.
+function demoteHeadings(text) {
+  let fenced = false
+  return String(text)
+    .split('\n')
+    .map(line => {
+      if (/^\s*(```|~~~)/.test(line)) {
+        fenced = !fenced
+        return line
+      }
+      if (fenced) return line
+      const match = /^#{1,6}\s+(.*)$/.exec(line)
+      if (!match) return line
+      const rest = match[1].trim()
+      return rest ? `**${rest}**` : ''
+    })
+    .join('\n')
+}
+
 function InjectionEntry({ entry, initiallyOpen }) {
   const [open, setOpen] = useState(Boolean(initiallyOpen))
   const [raw, setRaw] = useState(false)
+  const [expanded, setExpanded] = useState(false)
   const content =
     typeof entry.content === 'string' && entry.content.length > 0
       ? entry.content
       : ''
+  const collapsible = content.length > COLLAPSED_CONTENT_CHARS
+  const renderedContent = demoteHeadings(
+    collapsible && !expanded
+      ? `${content.slice(0, COLLAPSED_CONTENT_CHARS)}…`
+      : content
+  )
 
   return jsxs('section', {
     style: styles.card,
@@ -527,13 +558,13 @@ function InjectionEntry({ entry, initiallyOpen }) {
                     children: raw
                       ? jsx('pre', {
                           style: styles.pre,
-                          children: content.length > 320 ? `${content.slice(0, 320)}…` : content
+                          children: content
                         })
                       : jsx(Streamdown, {
                           controls: false,
                           mode: 'static',
                           parseIncompleteMarkdown: false,
-                          children: content.length > 320 ? `${content.slice(0, 320)}…` : content
+                          children: renderedContent
                         })
                   })
                 : entry.content_recorded
@@ -574,6 +605,24 @@ function InjectionEntry({ entry, initiallyOpen }) {
                             size: '0.75rem'
                           }),
                           raw ? 'Rendered' : 'Raw'
+                        ]
+                      })
+                    : null,
+                  content && !raw && collapsible
+                    ? jsxs(Button, {
+                        type: 'button',
+                        variant: 'ghost',
+                        size: 'xs',
+                        onClick: () => setExpanded(value => !value),
+                        title: expanded
+                          ? 'Réduire le texte injecté'
+                          : 'Afficher tout le texte injecté',
+                        children: [
+                          jsx(Codicon, {
+                            name: expanded ? 'chevron-up' : 'chevron-down',
+                            size: '0.75rem'
+                          }),
+                          expanded ? 'Réduire' : 'Afficher tout'
                         ]
                       })
                     : null,

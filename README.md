@@ -9,7 +9,7 @@ Inject [Hindsight](https://github.com/vectorize-io/hindsight) **mental models** 
 first turn of every Hermes Agent conversation, so each session starts with stable,
 cron-refreshed context instead of a hand-maintained `MEMORY.md` / `USER.md`.
 
-Version 0.6.0 — MIT.
+Version 0.6.1 — MIT.
 
 ## Why mental models instead of MEMORY.md / USER.md
 
