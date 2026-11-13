@@ -9,7 +9,7 @@ Inject [Hindsight](https://github.com/vectorize-io/hindsight) **mental models** 
 first turn of every Hermes Agent conversation, so each session starts with stable,
 cron-refreshed context instead of a hand-maintained `MEMORY.md` / `USER.md`.
 
-Version 0.6.2 — MIT.
+Version 0.6.3 — MIT.
 
 ## Why mental models instead of MEMORY.md / USER.md
 
@@ -56,12 +56,15 @@ history, newest first:
 - a **Copy** button for the exact injected text and a **Raw** toggle for the source.
 
 The pane drops the recall preamble and renders one card per memory, so the injected text
-reads as a stack of memories rather than one long paragraph.
+reads as a stack of memories rather than one long paragraph. It lists every injected block
+of a conversation — mental models and provider recall — not just the first one.
 
-The pane reads only this plugin's audit; it does not inspect other memory providers or the
-chat transcript. A new chat shows the empty state until its first injection. The default
-`mode: first_turn` produces one entry per chat; use `mode: every_turn` if you want the full
-per-turn timeline.
+The pane reads this plugin's audit and Hermes' read-only `state.db`, and shows the injected
+blocks it finds in the user messages: this plugin's mental models, the Hindsight provider's
+recall, and `<memory-context>` blocks. A new chat shows the empty state until its first
+injection. With `mode: first_turn` the plugin injects once per chat, but the pane can still
+list several blocks per conversation, because the provider recalls on other turns and those
+blocks are in `state.db`. Use `mode: every_turn` if you want the full per-turn timeline.
 
 In the Desktop app, enable the Desktop half under **Capabilities → Plugins** if it is off.
 If the pane was closed, reopen it with the command palette: **Show injected Hindsight

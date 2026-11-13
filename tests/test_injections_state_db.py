@@ -1,6 +1,18 @@
+import json
 import sqlite3
 
 import pytest
+
+PREAMBLE = (
+    "The following memories were recalled from your long-term memory.\n"
+    "Use them when they are relevant to the conversation."
+)
+
+
+def _write_config(tmp_path, payload):
+    config_dir = tmp_path / "hindsight"
+    config_dir.mkdir(parents=True, exist_ok=True)
+    (config_dir / "config.json").write_text(json.dumps(payload), "utf-8")
 
 
 def _make_db(tmp_path, rows):
@@ -99,4 +111,104 @@ def test_state_db_injections_missing_db(core, tmp_path):
 
     assert result["source"] == "unavailable"
     assert result.get("reason")
+    assert result["entries"] == []
+
+
+def test_state_db_injections_mental_models_without_tags(core, tmp_path):
+    plugin = (
+        "## Stable context (Hindsight mental models)\n\n"
+        "## operator-context\n\nhello"
+    )
+    api = "a question with no recall tags\n\n" + plugin
+    _make_db(
+        tmp_path,
+        [(503670, "sess1", "user", "a question", 1731234567.0, 1, api)],
+    )
+
+    result = core.read_state_db_injections("sess1", hermes_home=tmp_path, limit=200)
+
+    assert result["source"] == "state.db"
+    assert len(result["entries"]) == 1
+    entry = result["entries"][0]
+    assert entry["kind"] == "mental-models"
+    assert entry["text"].startswith("## Stable context (Hindsight mental models)")
+    assert entry["session_id"] == "sess1"
+    assert entry["recorded_at"]
+
+
+def test_state_db_injections_provider_recall_preamble(core, tmp_path):
+    _write_config(tmp_path, {"recall_prompt_preamble": PREAMBLE})
+    api = "# " + PREAMBLE + "\n\n- a recalled fact"
+    _make_db(
+        tmp_path,
+        [(503758, "sess1", "user", "a question", 1731234567.0, 1, api)],
+    )
+
+    result = core.read_state_db_injections("sess1", hermes_home=tmp_path, limit=200)
+
+    assert len(result["entries"]) == 1
+    entry = result["entries"][0]
+    assert entry["kind"] == "provider-recall"
+    assert entry["source"] == "provider recall"
+    assert entry["text"].startswith(PREAMBLE.splitlines()[0])
+    assert "- a recalled fact" in entry["text"]
+    assert entry["injected_chars"] == len(entry["text"])
+
+
+def test_state_db_injections_both_markers(core, tmp_path):
+    _write_config(tmp_path, {"recall_prompt_preamble": PREAMBLE})
+    plugin = "## Stable context (Hindsight mental model)\n\n## operator-context\n\nhi"
+    api = "q\n\n" + PREAMBLE + "\n\n- fact one\n\n" + plugin
+    _make_db(
+        tmp_path,
+        [(505392, "sess1", "user", "q", 1731234567.0, 1, api)],
+    )
+
+    result = core.read_state_db_injections("sess1", hermes_home=tmp_path, limit=200)
+
+    assert len(result["entries"]) == 2
+    by_kind = {entry["kind"]: entry for entry in result["entries"]}
+    assert set(by_kind) == {"provider-recall", "mental-models"}
+    assert by_kind["provider-recall"]["text"].startswith(PREAMBLE.splitlines()[0])
+    assert by_kind["mental-models"]["text"].startswith(
+        "## Stable context (Hindsight mental model)"
+    )
+
+
+def test_state_db_injections_preamble_inside_tags_is_not_duplicated(core, tmp_path):
+    _write_config(tmp_path, {"recall_prompt_preamble": PREAMBLE})
+    mem = "<memory-context>\n" + PREAMBLE + "\n- fact one\n</memory-context>"
+    _make_db(
+        tmp_path,
+        [(1, "sess1", "user", "q", 1731234567.0, 1, "q\n\n" + mem)],
+    )
+
+    result = core.read_state_db_injections("sess1", hermes_home=tmp_path, limit=200)
+
+    assert [entry["kind"] for entry in result["entries"]] == ["memory-context"]
+
+
+def test_state_db_injections_plain_user_text(core, tmp_path):
+    _write_config(tmp_path, {"recall_prompt_preamble": PREAMBLE})
+    _make_db(
+        tmp_path,
+        [(1, "sess1", "user", "just a question", 1731234567.0, 1, "just a question")],
+    )
+
+    result = core.read_state_db_injections("sess1", hermes_home=tmp_path, limit=200)
+
+    assert result["source"] == "state.db"
+    assert result["entries"] == []
+
+
+def test_state_db_injections_no_config_skips_preamble(core, tmp_path):
+    api = "q\n\n" + PREAMBLE + "\n\n- fact one"
+    _make_db(
+        tmp_path,
+        [(1, "sess1", "user", "q", 1731234567.0, 1, api)],
+    )
+
+    result = core.read_state_db_injections("sess1", hermes_home=tmp_path, limit=200)
+
+    assert result["source"] == "state.db"
     assert result["entries"] == []

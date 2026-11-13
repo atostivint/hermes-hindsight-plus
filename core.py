@@ -1034,6 +1034,42 @@ def _state_db_timestamp_to_iso(value):
 _MEMORY_CONTEXT_OPEN = "<memory-context>"
 _MEMORY_CONTEXT_CLOSE = "</memory-context>"
 _PLUGIN_BLOCK_MARKER = "## Stable context (Hindsight"
+# A recall preamble is matched on its head only: the tail can differ from the
+# config (the pane itself drops a leading ``# ``), and 200 characters are
+# specific enough that ordinary prose does not match by accident.
+_RECALL_PREAMBLE_PREFIX_CHARS = 200
+
+
+def _recall_preamble(hermes_home):
+    """Return the configured Hindsight recall preamble, or ``""``.
+
+    Read-only and fail-open, exactly like ``GET /recall-preamble`` in the
+    dashboard: a missing or unreadable file, bad JSON, a non-object config, a
+    non-string value and an empty (or whitespace-only) one all read as ``""``.
+    This is display metadata, so nothing here may raise or touch the network.
+    """
+    try:
+        path = pathlib.Path(hermes_home) / "hindsight" / "config.json"
+        config = json.loads(path.read_text("utf-8"))
+    except (OSError, ValueError):
+        return ""
+    if not isinstance(config, dict):
+        return ""
+    preamble = config.get("recall_prompt_preamble")
+    if not isinstance(preamble, str) or not preamble.strip():
+        return ""
+    return preamble[:_RECALL_PREAMBLE_PREFIX_CHARS]
+
+
+def _recall_preamble_index(text, preamble):
+    """Return where ``preamble`` starts in ``text``, or ``-1``.
+
+    A substring search, so a preamble shown with a leading ``# `` still matches
+    and the entry starts at the preamble itself, not at the ``#``.
+    """
+    if not preamble:
+        return -1
+    return text.find(preamble)
 
 
 def read_state_db_injections(session_id, hermes_home=None, limit=200) -> dict:
@@ -1042,6 +1078,13 @@ def read_state_db_injections(session_id, hermes_home=None, limit=200) -> dict:
     Returns ``{"session", "entries", "source", "reason"?}``. ``source`` is
     ``"state.db"`` when the database could be read, ``"unavailable"`` otherwise.
     Never writes to the database.
+
+    One entry per injected block found in a message, whatever its marker:
+    ``kind`` is ``"memory-context"`` for the provider block between the
+    ``<memory-context>`` tags, ``"mental-models"`` for this plugin's
+    ``## Stable context (Hindsight ...)`` header, and ``"provider-recall"`` for
+    a bare configured recall preamble. ``source`` keeps its historical value
+    (the Desktop pane branches on it) and ``kind`` says which marker matched.
     """
     session_id = _clean_id(session_id)
     limit = max(1, min(1000, _as_int(limit, 200)))
@@ -1092,6 +1135,8 @@ def read_state_db_injections(session_id, hermes_home=None, limit=200) -> dict:
             except sqlite3.Error:
                 pass
 
+    preamble = _recall_preamble(home)
+
     entries = []
     for row in rows:
         try:
@@ -1105,12 +1150,20 @@ def read_state_db_injections(session_id, hermes_home=None, limit=200) -> dict:
         recorded_at = _state_db_timestamp_to_iso(timestamp)
 
         # Provider recall block: between <memory-context> and </memory-context>.
+        # This spans the tags and is the only marker whose end is known; the
+        # other two run to the end of the message, so a marker that falls
+        # inside this span is never reported a second time.
+        tag_span = None
         open_idx = api_content.find(_MEMORY_CONTEXT_OPEN)
         if open_idx != -1:
             close_idx = api_content.find(
                 _MEMORY_CONTEXT_CLOSE, open_idx + len(_MEMORY_CONTEXT_OPEN)
             )
             if close_idx != -1:
+                tag_span = (
+                    open_idx,
+                    close_idx + len(_MEMORY_CONTEXT_CLOSE),
+                )
                 inner = api_content[
                     open_idx + len(_MEMORY_CONTEXT_OPEN) : close_idx
                 ]
@@ -1140,6 +1193,8 @@ def read_state_db_injections(session_id, hermes_home=None, limit=200) -> dict:
                     {
                         "id": row_id,
                         "recorded_at": recorded_at,
+                        "session_id": session_id,
+                        "kind": "memory-context",
                         "source": "provider recall",
                         "bank": bank_id,
                         "count": count,
@@ -1150,8 +1205,11 @@ def read_state_db_injections(session_id, hermes_home=None, limit=200) -> dict:
                     }
                 )
 
-        # Plugin mental-models block: starts with the stable-context header.
+        # Plugin mental-models block: starts with the stable-context header and
+        # is appended last, so it runs to the end of the message.
         plugin_idx = api_content.find(_PLUGIN_BLOCK_MARKER)
+        if tag_span is not None and tag_span[0] <= plugin_idx < tag_span[1]:
+            plugin_idx = -1
         if plugin_idx != -1:
             block = api_content[plugin_idx:].strip()
             count = sum(
@@ -1170,6 +1228,8 @@ def read_state_db_injections(session_id, hermes_home=None, limit=200) -> dict:
                 {
                     "id": row_id,
                     "recorded_at": recorded_at,
+                    "session_id": session_id,
+                    "kind": "mental-models",
                     "source": "plugin mental-models",
                     "bank": bank_id,
                     "count": count,
@@ -1179,6 +1239,32 @@ def read_state_db_injections(session_id, hermes_home=None, limit=200) -> dict:
                     "turn_id": "",
                 }
             )
+
+        # A bare recall preamble (the provider not wrapping its recall in the
+        # tags above) also runs to the end of the message.
+        preamble_idx = _recall_preamble_index(api_content, preamble)
+        if tag_span is not None:
+            covered = tag_span[0] <= preamble_idx < tag_span[1]
+            if covered:
+                preamble_idx = -1
+        if preamble_idx != -1:
+            text = api_content[preamble_idx:].strip()
+            if text:
+                entries.append(
+                    {
+                        "id": row_id,
+                        "recorded_at": recorded_at,
+                        "session_id": session_id,
+                        "kind": "provider-recall",
+                        "source": "provider recall",
+                        "bank": bank_id,
+                        "count": None,
+                        "injected_chars": len(text),
+                        "status": "injected",
+                        "text": text[:4000],
+                        "turn_id": "",
+                    }
+                )
 
     result["entries"] = entries
     result["source"] = "state.db"

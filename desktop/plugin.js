@@ -416,6 +416,10 @@ function normalizeStateEntry(entry, bank) {
     id: entry && entry.id,
     recorded_at: (entry && entry.recorded_at) || new Date().toISOString(),
     source,
+    // One message can carry several injected blocks (memory-context,
+    // mental-models, provider-recall) under the same row id; `kind` keeps them
+    // apart. Local-audit entries have no kind and default to ''.
+    kind: (entry && entry.kind) || '',
     bank: (entry && entry.bank) || bank || '—',
     count,
     injected_chars:
@@ -440,7 +444,9 @@ function dedupeInjectionEntries(entries) {
     const minute = Number.isNaN(date.getTime())
       ? String(entry.recorded_at || '')
       : date.toISOString().slice(0, 16)
-    const key = `${entry.source || ''}|${minute}`
+    // A provider recall and a mental-model injection of the same minute are two
+    // different blocks: collapse only entries that share both source and kind.
+    const key = `${entry.source || ''}|${entry.kind || ''}|${minute}`
     if (seen.has(key)) continue
     seen.add(key)
     out.push(entry)
@@ -748,6 +754,24 @@ function PaneBody({ scope, history }) {
     return (Number.isFinite(left) ? left : 0) - (Number.isFinite(right) ? right : 0)
   })
 
+  // A provider-recall block runs to the end of its message, so it swallows the
+  // mental-model block appended to that same message and would show it twice.
+  // Cut the displayed text at the stable-context header, on a copy: the entry
+  // objects cached by the queries are left untouched.
+  const mentalModelIds = new Set(
+    entries
+      .filter(entry => entry.kind === 'mental-models' && entry.id != null)
+      .map(entry => String(entry.id))
+  )
+  const displayEntries = entries.map(entry => {
+    if (entry.kind !== 'provider-recall' || entry.id == null) return entry
+    if (!mentalModelIds.has(String(entry.id))) return entry
+    const text = typeof entry.content === 'string' ? entry.content : ''
+    const cut = text.indexOf('## Stable context (Hindsight')
+    if (cut === -1) return entry
+    return { ...entry, content: text.slice(0, cut).trimEnd() }
+  })
+
   if (!scope) {
     return jsx('div', {
       style: styles.centered,
@@ -814,11 +838,13 @@ function PaneBody({ scope, history }) {
       style: styles.list,
       children: [
         unavailableNote,
-        ...entries.map((entry, index) =>
+        ...displayEntries.map((entry, index) =>
           jsx(
             InjectionEntry,
             { entry, initiallyOpen: index === 0, preamble },
-            entry.id || `${entry.recorded_at || 'entry'}-${index}`
+            // Entries of one message share the row id: the kind keeps the key
+            // unique and stable across re-renders.
+            `${entry.id || `${entry.recorded_at || 'entry'}-${index}`}:${entry.kind || 'audit'}`
           )
         )
       ]
