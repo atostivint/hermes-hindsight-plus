@@ -185,6 +185,33 @@ def test_sort_by_age_or_volatile_differ(review):
         review.sort_items([], "bogus")
 
 
+def test_risk_sorts_volatile_first_then_age_then_staleness(review):
+    """``risk`` puts a recent risky fact above an old but textually stable one."""
+    risky = review.score_item(
+        {"id": "risky", "text": "migration is pending in commit a1b2c3d4e5", "date": _iso(10)},
+        NOW,
+    )
+    old_plain = review.score_item({"id": "old", "text": "plain note", "date": _iso(300)}, NOW)
+    assert risky["volatile_score"] == 0.5 and old_plain["volatile_score"] == 0.0
+
+    assert [i["id"] for i in review.sort_items([old_plain, risky], "risk")] == ["risky", "old"]
+    # the default ranking is the opposite one: that is the ordering ``risk`` adds
+    assert [
+        i["id"] for i in review.sort_items([old_plain, risky], "staleness")
+    ] == ["old", "risky"]
+
+    # equal volatile score: the older fact goes first
+    newer = review.score_item({"id": "newer", "text": "plain note", "date": _iso(100)}, NOW)
+    assert [i["id"] for i in review.sort_items([newer, old_plain], "risk")] == ["old", "newer"]
+
+    # hand-built items pin the last key: equal volatile and equal age, staleness decides
+    weaker = {"id": "weaker", "volatile_score": 0.5, "age_score": 0.2, "staleness": 0.3}
+    stronger = {"id": "stronger", "volatile_score": 0.5, "age_score": 0.2, "staleness": 0.6}
+    assert [
+        i["id"] for i in review.sort_items([weaker, stronger], "risk")
+    ] == ["stronger", "weaker"]
+
+
 # --- volatile heuristic --------------------------------------------------------
 
 
@@ -563,6 +590,41 @@ def test_dashboard_review_routes_end_to_end(stub, monkeypatch, tmp_path):
 # --- global ranking / work queue -----------------------------------------------
 
 
+def test_dashboard_review_list_accepts_sort_risk_and_volatile_only(stub, monkeypatch, tmp_path):
+    """The route forwards ``sort=risk`` and ``volatile_only``; an unknown sort is a 400."""
+    hermes_home = tmp_path / "home"
+    (hermes_home / "hindsight").mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setenv("HINDSIGHT_API_URL", stub.url)
+    monkeypatch.setenv("HINDSIGHT_API_KEY", SECRET)
+    stub.memories["m1"]["text"] = "host is 10.0.0.5"  # volatile 0.35, unique in the stub
+    module, http_exc = _load_api(monkeypatch)
+    try:
+        ranked = module.review_list("hermes", limit=100, offset=0, state="valid",
+                                    sort="risk", q="")
+        assert ranked["sort"] == "risk"
+        assert [i["id"] for i in ranked["items"]] == ["m1", "m2", "obs"]
+        assert SECRET not in json.dumps(ranked)
+
+        risky_only = module.review_list(
+            "hermes", limit=100, offset=0, state="valid", sort="risk", q="",
+            volatile_only=True,
+        )
+        assert [i["id"] for i in risky_only["items"]] == ["m1"]
+        assert risky_only["matched"] == 1
+        assert risky_only["to_review"] == 3  # the queue size is not narrowed by the flag
+
+        with pytest.raises(http_exc) as exc:
+            module.review_list("hermes", limit=100, offset=0, state="valid",
+                               sort="bogus", q="")
+        assert exc.value.status_code == 400
+        assert exc.value.detail == "sort must be one of: age, volatile, staleness, risk"
+    finally:
+        for name in ("hermes_hindsight_plus_dashboard_core",
+                     "hermes_hindsight_plus_dashboard_review"):
+            sys.modules.pop(name, None)
+
+
 class QueueHindsight:
     """A paging-aware stub: honours ``limit``/``offset`` and records every request."""
 
@@ -805,6 +867,85 @@ def test_curatable_only_default_is_the_unchanged_output(review, queue):
     assert explicit == default
     assert default["matched"] == 3
     assert len(default["items"]) == 3
+    assert default["to_review"] == 2
+
+
+def test_volatile_only_keeps_only_facts_with_a_volatile_score(review, queue):
+    facts = [
+        _fact("risky", 10, "host is 10.0.0.5"),  # volatile 0.35
+        _fact("old", 400),                       # volatile 0
+        _fact("versioned", 0, "runs v1.2.3"),    # volatile 0.25
+    ]
+    _stub, client = queue(facts)
+
+    everything = review.list_review(client, "hermes", now=NOW)
+    volatile = review.list_review(client, "hermes", now=NOW, volatile_only=True)
+
+    assert everything["matched"] == 3
+    assert volatile["matched"] == 2
+    assert [i["id"] for i in volatile["items"]] == ["risky", "versioned"]
+    assert all(i["volatile_score"] > 0 for i in volatile["items"])
+    assert volatile["scanned"] == 3
+    # the queue size is the ledger-filtered scan, never narrowed by this flag
+    assert volatile["to_review"] == everything["to_review"] == 3
+
+
+def test_volatile_only_combines_with_review_only_and_curatable_only(review, queue):
+    """Three filters, one set: each drops what the others keep."""
+    facts = [
+        _fact("plain", 400),                                         # stale, curatable, quiet
+        _fact("obs-plain", 400, fact_type="observation"),            # stale, not curatable
+        _fact("volatile-obs", 300, "ip 10.0.0.7", fact_type="observation"),
+        _fact("volatile-world", 300, "currently v2.0.1"),
+    ]
+    _stub, client = queue(facts)
+
+    def ids(**flags):
+        result = review.list_review(client, "hermes", now=NOW, **flags)
+        assert result["matched"] == len(result["items"])
+        return {i["id"] for i in result["items"]}
+
+    assert ids() == {"plain", "obs-plain", "volatile-obs", "volatile-world"}
+    assert ids(volatile_only=True) == {"volatile-obs", "volatile-world"}
+    assert ids(curatable_only=True) == {"plain", "volatile-world"}
+    assert ids(review_only=True, curatable_only=True) == {"plain", "volatile-world"}
+    assert ids(review_only=True, volatile_only=True) == {"volatile-obs", "volatile-world"}
+    assert ids(curatable_only=True, volatile_only=True) == {"volatile-world"}
+    assert ids(review_only=True, curatable_only=True, volatile_only=True) == {"volatile-world"}
+
+
+def test_offset_slices_the_volatile_filtered_set(review, queue):
+    facts = [
+        _fact("plain-old", 300),                        # volatile 0: would sit inside the window
+        _fact("volatile-a", 200, "pending"),
+        _fact("volatile-b", 100, "see http://nas.local/share"),
+        _fact("volatile-c", 50, "v1.2.3"),
+    ]
+    _stub, client = queue(facts)
+
+    page = review.list_review(client, "hermes", limit=2, offset=1, now=NOW, volatile_only=True)
+
+    assert page["matched"] == 3
+    # unfiltered, offset 1..3 would be volatile-a, volatile-b
+    assert [i["id"] for i in page["items"]] == ["volatile-b", "volatile-c"]
+    assert page["offset"] == 1 and page["limit"] == 2
+    assert page["to_review"] == 4
+
+
+def test_volatile_only_default_is_the_unchanged_output(review, queue):
+    facts = [
+        _fact("volatile", 200, "currently on 10.0.0.5"),
+        _fact("plain", 400),
+        _fact("fresh", 0),
+    ]
+    _stub, client = queue(facts)
+
+    default = review.list_review(client, "hermes", now=NOW)
+    explicit = review.list_review(client, "hermes", now=NOW, volatile_only=False)
+
+    assert explicit == default
+    assert [i["id"] for i in default["items"]] == ["volatile", "plain", "fresh"]
+    assert default["matched"] == 3
     assert default["to_review"] == 2
 
 

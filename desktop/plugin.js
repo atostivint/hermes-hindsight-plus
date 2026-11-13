@@ -1061,6 +1061,9 @@ function pct(value) {
 }
 
 function sortReview(items, key) {
+  // 'risk' is ranked by the backend (volatile text first, then staleness): the
+  // page keeps the server's order instead of re-sorting on an unknown field.
+  if (key === 'risk') return items
   const field = { age: 'age_score', volatile: 'volatile_score', staleness: 'staleness' }[key]
   return [...items].sort((a, b) => (b[field] || 0) - (a[field] || 0))
 }
@@ -1480,7 +1483,7 @@ function ReviewHelpPanel({ onClose }) {
 function MemoryReviewPage() {
   const [bank, setBank] = useState('hermes')
   const [state, setState] = useState('valid')
-  const [sort, setSort] = useState('staleness')
+  const [sort, setSort] = useState('risk')
   const [offset, setOffset] = useState(0)
   const [selected, setSelected] = useState({})
   const [action, setAction] = useState(null)
@@ -1499,9 +1502,11 @@ function MemoryReviewPage() {
   const [editingId, setEditingId] = useState(null)
   const [editText, setEditText] = useState('')
   const [view, setView] = useState('list')
-  // Page-local filters: whether only the revocable fact types are listed, and the
-  // "?" glossary. Both live in component state only, never in a URL or storage.
+  // Page-local filters: whether only the revocable fact types are listed, whether
+  // only the facts carrying a volatile value are listed, and the "?" glossary.
+  // All live in component state only, never in a URL or storage.
   const [curatableOnly, setCuratableOnly] = useState(false)
+  const [volatileOnly, setVolatileOnly] = useState(false)
   const [help, setHelp] = useState(false)
   // Session-local bookkeeping for the card deck: ids that already left it (any
   // verdict), and whether the deck was refetched once after running out.
@@ -1514,10 +1519,11 @@ function MemoryReviewPage() {
 
   const cards = view === 'cards'
   const searchTerm = debouncedSearch
-  const key = [ID, 'review', bank, state, offset, view, searchTerm, curatableOnly]
-  // The backend ignores `curatable_only` when it does not know it, so sending it
-  // unconditionally is safe on an older dashboard.
+  const key = [ID, 'review', bank, state, offset, view, searchTerm, curatableOnly, volatileOnly, sort]
+  // The backend ignores `curatable_only` and `volatile_only` when it does not
+  // know them, so sending them unconditionally is safe on an older dashboard.
   const curatableParam = curatableOnly ? '&curatable_only=1' : ''
+  const volatileParam = volatileOnly ? '&volatile_only=1' : ''
 
   // A search runs over the whole bank server-side, so it must not fire on every
   // keystroke: the query key only sees the debounced value.
@@ -1531,15 +1537,15 @@ function MemoryReviewPage() {
     queryFn: () =>
       reviewCall(
         cards
-          ? `/review/${bank}/memories?limit=100&offset=0&state=valid&sort=staleness&review_only=1&q=${encodeURIComponent(searchTerm)}${curatableParam}`
-          : `/review/${bank}/memories?limit=100&offset=${offset}&state=${state}&sort=staleness&review_only=0&q=${encodeURIComponent(searchTerm)}${curatableParam}`
+          ? `/review/${bank}/memories?limit=100&offset=0&state=valid&sort=${sort}&review_only=1&q=${encodeURIComponent(searchTerm)}${curatableParam}${volatileParam}`
+          : `/review/${bank}/memories?limit=100&offset=${offset}&state=${state}&sort=${sort}&review_only=0&q=${encodeURIComponent(searchTerm)}${curatableParam}${volatileParam}`
       ),
     staleTime: 10000,
     retry: 1
   })
 
   const items = sortReview(Array.isArray(query.data?.items) ? query.data.items : [], sort)
-  // The deck keeps the server's order (the queue is sorted by staleness there).
+  // The deck keeps the server's order (the backend sorts it by the selected sort).
   const deckItems = cards && Array.isArray(query.data?.items) ? query.data.items : []
   // Session-local cursor: the first card the user has not decided on yet.
   const deckRemaining = deckItems.filter(i => !skipped[i.id])
@@ -1585,13 +1591,12 @@ function MemoryReviewPage() {
     }
   }
 
-  // A new bank, view, search term or type filter starts a fresh deck. `state` and
-  // `sort` are deliberately absent: both selects are list-only and the deck URL
-  // hardcodes them, so they can only clear `skipped` without changing the query.
+  // A new bank, view, search term or fact filter starts a fresh deck. `state` is
+  // deliberately absent: that select is list-only and the deck URL fixes it.
   useEffect(() => {
     setSkipped({})
     setDeckDone(false)
-  }, [bank, view, searchTerm, curatableOnly])
+  }, [bank, view, searchTerm, curatableOnly, volatileOnly])
 
   // Deck exhausted: refetch once so the facts just decided leave and the next
   // batch of the queue loads.
@@ -1839,14 +1844,22 @@ function MemoryReviewPage() {
             onClick: () => { setCuratableOnly(v => !v); setOffset(0) },
             children: 'Curatables seulement'
           }),
+          jsx(Button, {
+            type: 'button', size: 'xs', variant: volatileOnly ? 'primary' : 'secondary',
+            title: volatileOnly
+              ? 'Afficher tous les faits'
+              : 'Ne garder que les faits dont le texte porte une valeur volatile (IP, URL de LAN, version, hash de commit, temps relatif) : ceux qui sont probablement faux maintenant',
+            onClick: () => { setVolatileOnly(v => !v); setOffset(0) },
+            children: 'À vérifier'
+          }),
           select(bank, v => { setBank(v); setOffset(0); setSelected({}) }, REVIEW_BANKS.map(b => [b, b])),
-          // `state` and `sort` are list-only: the deck's URL hardcodes both.
+          // `state` is list-only: the deck's URL fixes it to `valid`.
           cards
             ? null
             : select(state, v => { setState(v); setOffset(0) }, [['valid', 'valid'], ['invalidated', 'revoked']]),
           cards
             ? null
-            : select(sort, setSort, [['staleness', 'Sort: staleness'], ['age', 'Sort: age'], ['volatile', 'Sort: volatile']]),
+            : select(sort, setSort, [['risk', 'Risque (recommandé)'], ['staleness', 'Sort: staleness'], ['age', 'Sort: age'], ['volatile', 'Sort: volatile']]),
           jsx(Input, {
             style: { ...rv.field, minWidth: 160, flex: 1 },
             value: search,
@@ -1954,7 +1967,14 @@ function MemoryReviewPage() {
                         : null,
                       card
                         ? jsx(ReviewCard, { item: card, verdict: verdicts[card.id], busy, onVerdict: decide })
-                        : curatableOnly && deckItems.length === 0
+                        : volatileOnly && deckItems.length === 0 && (query.data?.to_review ?? 0) > 0
+                          // Queue not empty but nothing perishable in it: the filter,
+                          // not the queue, is what emptied the deck.
+                          ? jsx(EmptyState, {
+                              title: 'Aucun fait volatil',
+                              description: 'Aucun souvenir de cette file ne porte de valeur périssable : désactive « À vérifier » pour voir le reste.'
+                            })
+                          : curatableOnly && deckItems.length === 0
                           // Queue not empty (`to_review > 0`) but nothing curable in
                           // it: explain the filter instead of claiming the deck ended.
                           ? jsx(EmptyState, {
@@ -1987,7 +2007,12 @@ function MemoryReviewPage() {
                   style: { ...styles.centered, gap: 10 },
                   children: [
                     truncatedNote,
-                    jsx(EmptyState, { title: 'Aucun fait ici', description: 'Rien à revoir dans cette banque et cet état.' }),
+                    jsx(EmptyState, volatileOnly
+                      ? {
+                          title: 'Aucun fait volatil',
+                          description: 'Aucun souvenir de cette page ne porte de valeur périssable : désactive « À vérifier » pour voir le reste.'
+                        }
+                      : { title: 'Aucun fait ici', description: 'Rien à revoir dans cette banque et cet état.' }),
                     // Past the scan window the page is empty but the offset is not 0:
                     // keep a way back instead of a dead end.
                     offset > 0

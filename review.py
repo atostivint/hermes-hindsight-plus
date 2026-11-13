@@ -42,7 +42,7 @@ AGE_SATURATION_DAYS = 365
 REASON_PREFIXES = ("superseded by ", "outdated: ")
 
 _ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
-_SORTS = ("age", "volatile", "staleness")
+_SORTS = ("age", "volatile", "staleness", "risk")
 _STATES = ("valid", "invalidated")
 _TAG_RE = re.compile(r"^[a-z0-9-]{1,40}$")
 
@@ -162,8 +162,22 @@ def check_sort(sort):
 
 
 def sort_items(items, sort):
-    """Sort scored items, most stale first. Unknown ages sort as the freshest."""
+    """Sort scored items, most stale first. Unknown ages sort as the freshest.
+
+    ``risk`` ranks the facts a stale value is likeliest to break first: by
+    ``volatile_score`` descending (a fact carrying an IP address, a version, a
+    commit hash or a "currently" wording outranks one that merely got old), then
+    by ``age_score`` descending, then by ``staleness`` descending. ``age``,
+    ``volatile`` and ``staleness`` keep their single-key ranking with the other
+    score as tiebreak.
+    """
     check_sort(sort)
+    if sort == "risk":
+        return sorted(
+            items,
+            key=lambda it: (it["volatile_score"], it["age_score"], it["staleness"]),
+            reverse=True,
+        )
     key = {"age": "age_score", "volatile": "volatile_score", "staleness": "staleness"}[sort]
     tiebreak = "staleness" if key != "staleness" else "age_score"
     return sorted(items, key=lambda it: (it[key], it[tiebreak]), reverse=True)
@@ -353,7 +367,7 @@ def needs_review(item, decisions=None, now=None):
 
 
 def list_review(client, bank, limit=100, offset=0, state="valid", sort="staleness", q="", now=None,
-                *, review_only=False, curatable_only=False, decisions=None):
+                *, review_only=False, curatable_only=False, volatile_only=False, decisions=None):
     """Rank a bank's facts globally, then return one ``offset..offset+limit`` slice.
 
     The client scans at most ``MAX_SCAN`` facts in at most ``MAX_CALLS`` upstream
@@ -382,6 +396,12 @@ def list_review(client, bank, limit=100, offset=0, state="valid", sort="stalenes
     ``offset``/``limit`` window all describe the filtered set. ``to_review`` keeps
     its meaning: the queue size after the ledger, unaffected by this flag.
 
+    ``volatile_only`` keeps only the facts whose ``volatile_score`` is above zero,
+    i.e. the ones carrying a value likely to have changed (an IP address, a version,
+    a commit hash, a relative wording). It combines with the filters above, before
+    sorting and slicing, so ``items``, ``matched`` and the window describe the
+    filtered set; ``to_review`` is unaffected by it, like ``curatable_only``.
+
     ``decisions`` is that bank's local ledger (``{memory_id: decision}``). A fact is
     dropped from the queue once the user marked it ``"still true"`` against the same
     text hash and that decision is younger than ``OK_TTL_DAYS``; any mismatch makes
@@ -403,6 +423,8 @@ def list_review(client, bank, limit=100, offset=0, state="valid", sort="stalenes
     kept = queue if review_only else scored
     if curatable_only:
         kept = [item for item in kept if item.get("curatable")]
+    if volatile_only:
+        kept = [item for item in kept if (item.get("volatile_score") or 0) > 0]
     ordered = sort_items(kept, sort)
     return {
         "bank": bank,
