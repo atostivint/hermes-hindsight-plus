@@ -1,7 +1,7 @@
 {
   "name": "hermes-hindsight-plus",
   "label": "Hindsight Memory",
-  "version": "0.6.1",
+  "version": "0.6.2",
   "description": "Read-only backend for the Desktop pane that shows the Hindsight mental-model context injected into each chat.",
   "icon": "Book",
   "api": "plugin_api.py",

@@ -9,7 +9,7 @@ Inject [Hindsight](https://github.com/vectorize-io/hindsight) **mental models** 
 first turn of every Hermes Agent conversation, so each session starts with stable,
 cron-refreshed context instead of a hand-maintained `MEMORY.md` / `USER.md`.
 
-Version 0.6.1 — MIT.
+Version 0.6.2 — MIT.
 
 ## Why mental models instead of MEMORY.md / USER.md
 
@@ -54,6 +54,9 @@ history, newest first:
 - the user-message preview and the rendered Markdown that was appended, when content
   recording is enabled;
 - a **Copy** button for the exact injected text and a **Raw** toggle for the source.
+
+The pane drops the recall preamble and renders one card per memory, so the injected text
+reads as a stack of memories rather than one long paragraph.
 
 The pane reads only this plugin's audit; it does not inspect other memory providers or the
 chat transcript. A new chat shows the empty state until its first injection. The default

@@ -1,11 +1,12 @@
 """Dashboard API for the Hindsight memory pane.
 
 The Desktop half reads the plugin's local injection audit through the
-read-only ``/health``, ``/history`` and ``/sessions`` routes (the opt-in memory
-review routes below are the only ones that write, via Hindsight's soft
-``PATCH /memories/{id}``). The audit is written by ``core.record_injection`` during
-``pre_llm_call``; this module deliberately reuses that module's reader so both
-halves agree on the retention and alias rules.
+read-only ``/health``, ``/history`` and ``/sessions`` routes and the configured
+recall preamble through ``/recall-preamble`` (the opt-in memory review routes
+below are the only ones that write, via Hindsight's soft ``PATCH /memories/{id}``).
+The audit is written by ``core.record_injection`` during ``pre_llm_call``; this
+module deliberately reuses that module's reader so both halves agree on the
+retention and alias rules.
 
 Mounted by Hermes at ``/api/plugins/hermes-hindsight-plus/``. No route accepts
 a filesystem path: the only inputs are a session identifier and a bounded
@@ -329,6 +330,40 @@ def review_apply(bank: str, payload: Annotated[Any, Body()] = None):
 
 
 # ==== end Memory review =========================================================
+
+
+# ==== recall preamble (Desktop memory pane) =====================================
+# The pane shows the recalled text verbatim. Hindsight opens it with a configured
+# recall preamble the user does not need to read, and the pane cannot know where it
+# ends without the value: it lives in ``<HERMES_HOME>/hindsight/config.json``.
+# Display sugar only -- no route here calls Hindsight or touches the API key.
+
+RECALL_PREAMBLE_CAP = 4000
+
+
+@router.get("/recall-preamble")
+def recall_preamble():
+    """Return the configured Hindsight recall preamble, or ``""``.
+
+    Read-only and fail-open: a missing or unreadable file, bad JSON, a non-object
+    config, a non-string value or an empty one all read as ``""``; the route never
+    raises. The value is returned verbatim, capped at ``RECALL_PREAMBLE_CAP``
+    characters because a config can hold anything.
+    """
+    try:
+        path = pathlib.Path(_core()._hermes_home()) / "hindsight" / "config.json"
+        config = json.loads(path.read_text("utf-8"))
+    except Exception:  # noqa: BLE001 - display sugar must never turn into a 500
+        return {"preamble": ""}
+    if not isinstance(config, dict):
+        return {"preamble": ""}
+    preamble = config.get("recall_prompt_preamble")
+    if not isinstance(preamble, str) or not preamble:
+        return {"preamble": ""}
+    return {"preamble": preamble[:RECALL_PREAMBLE_CAP]}
+
+
+# ==== end recall preamble =======================================================
 
 
 @router.get("/health")

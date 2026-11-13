@@ -158,6 +158,15 @@ const styles = {
     color: 'var(--ui-text-primary)',
     overflowWrap: 'anywhere'
   },
+  // One box per memory: a `## <name>` heading and all of its paragraphs share
+  // one outline, instead of one long paragraph flow.
+  block: {
+    padding: '6px 8px',
+    marginBottom: 6,
+    border: '1px solid var(--ui-stroke-secondary)',
+    borderRadius: 6,
+    background: 'var(--ui-surface-background, transparent)'
+  },
   pre: {
     margin: 0,
     padding: 8,
@@ -453,7 +462,65 @@ function useHealthBank() {
   return query && query.data ? query.data.bank : null
 }
 
-const COLLAPSED_CONTENT_CHARS = 400
+// The configured recall preamble repeats on every entry and carries no memory
+// of its own, so the pane fetches it once and drops the matching block. A
+// missing route or an offline API resolves to '' and drops nothing.
+function useRecallPreamble() {
+  const query = useQuery({
+    queryKey: [ID, 'recall-preamble'],
+    queryFn: () =>
+      reviewCall('/recall-preamble', { timeoutMs: 5000 })
+        .then(data =>
+          data && typeof data.preamble === 'string' ? data.preamble : ''
+        )
+        .catch(() => ''),
+    enabled: Boolean(rest),
+    staleTime: Infinity,
+    retry: false
+  })
+  return typeof query.data === 'string' ? query.data : ''
+}
+
+// The injected text is a preamble, then one `## <name>` section per memory
+// (`core.py`), each heading followed by its paragraphs. Compare on the first
+// 200 characters so a truncated (…) preamble still matches; case-sensitive,
+// trimmed.
+function isPreambleBlock(block, preamble) {
+  const left = String(block || '').trim()
+  const right = String(preamble || '').trim()
+  if (!left || !right) return false
+  if (left === right) return true
+  // A truncated injection cuts the preamble mid-text (trailing …): the first
+  // 200 characters are then identical on both sides.
+  return left.slice(0, 200) === right.slice(0, 200)
+}
+
+// A heading block starts a memory; every following block that is not a heading
+// belongs to it, joined back with a blank line so `demoteHeadings` still sees
+// one document per card. Text before the first heading is its own group.
+function groupInjectionBlocks(blocks) {
+  const groups = []
+  let current = ''
+  for (const block of blocks) {
+    if (/^#{1,6}\s/.test(block)) {
+      if (current) groups.push(current)
+      current = block
+    } else {
+      current = current ? `${current}\n\n${block}` : block
+    }
+  }
+  if (current) groups.push(current)
+  return groups
+}
+
+function splitInjectionBlocks(content, preamble) {
+  const blocks = String(content || '')
+    .split(/\n\s*\n/)
+    .map(block => block.trim())
+    .filter(Boolean)
+  if (blocks.length > 0 && isPreambleBlock(blocks[0], preamble)) blocks.shift()
+  return groupInjectionBlocks(blocks)
+}
 
 // The pane is ~360px wide: a Markdown heading would render at heading size and
 // swallow the whole card. Demote `#`-lines to bold paragraphs for display only
@@ -477,20 +544,14 @@ function demoteHeadings(text) {
     .join('\n')
 }
 
-function InjectionEntry({ entry, initiallyOpen }) {
+function InjectionEntry({ entry, initiallyOpen, preamble }) {
   const [open, setOpen] = useState(Boolean(initiallyOpen))
   const [raw, setRaw] = useState(false)
-  const [expanded, setExpanded] = useState(false)
   const content =
     typeof entry.content === 'string' && entry.content.length > 0
       ? entry.content
       : ''
-  const collapsible = content.length > COLLAPSED_CONTENT_CHARS
-  const renderedContent = demoteHeadings(
-    collapsible && !expanded
-      ? `${content.slice(0, COLLAPSED_CONTENT_CHARS)}…`
-      : content
-  )
+  const blocks = content ? splitInjectionBlocks(content, preamble) : []
 
   return jsxs('section', {
     style: styles.card,
@@ -560,12 +621,28 @@ function InjectionEntry({ entry, initiallyOpen }) {
                           style: styles.pre,
                           children: content
                         })
-                      : jsx(Streamdown, {
-                          controls: false,
-                          mode: 'static',
-                          parseIncompleteMarkdown: false,
-                          children: renderedContent
-                        })
+                      : blocks.length > 0
+                        ? jsxs('div', {
+                            children: blocks.map((block, index) =>
+                              jsx(
+                                'div',
+                                {
+                                  style: styles.block,
+                                  children: jsx(Streamdown, {
+                                    controls: false,
+                                    mode: 'static',
+                                    parseIncompleteMarkdown: false,
+                                    children: demoteHeadings(block)
+                                  })
+                                },
+                                String(index)
+                              )
+                            )
+                          })
+                        : jsx('div', {
+                            style: styles.note,
+                            children: 'Aucun souvenir à afficher pour cette injection.'
+                          })
                   })
                 : entry.content_recorded
                   ? jsx('div', {
@@ -605,24 +682,6 @@ function InjectionEntry({ entry, initiallyOpen }) {
                             size: '0.75rem'
                           }),
                           raw ? 'Rendered' : 'Raw'
-                        ]
-                      })
-                    : null,
-                  content && !raw && collapsible
-                    ? jsxs(Button, {
-                        type: 'button',
-                        variant: 'ghost',
-                        size: 'xs',
-                        onClick: () => setExpanded(value => !value),
-                        title: expanded
-                          ? 'Réduire le texte injecté'
-                          : 'Afficher tout le texte injecté',
-                        children: [
-                          jsx(Codicon, {
-                            name: expanded ? 'chevron-up' : 'chevron-down',
-                            size: '0.75rem'
-                          }),
-                          expanded ? 'Réduire' : 'Afficher tout'
                         ]
                       })
                     : null,
@@ -668,6 +727,7 @@ function PaneBody({ scope, history }) {
   const { data, error, isFetching, isLoading, refetch } = history
   const injections = useInjections(scope)
   const healthBank = useHealthBank()
+  const preamble = useRecallPreamble()
   const bank = (data && data.bank) || (injections.data && injections.data.bank) || healthBank
   const pluginEntries = Array.isArray(data?.entries) ? data.entries : []
   const stateEntries = Array.isArray(injections.data?.entries)
@@ -757,7 +817,7 @@ function PaneBody({ scope, history }) {
         ...entries.map((entry, index) =>
           jsx(
             InjectionEntry,
-            { entry, initiallyOpen: index === 0 },
+            { entry, initiallyOpen: index === 0, preamble },
             entry.id || `${entry.recorded_at || 'entry'}-${index}`
           )
         )
