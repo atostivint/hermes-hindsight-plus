@@ -32,6 +32,9 @@ File de travail réelle. Une ligne par item ; `done` = mergé et vérifié, `rea
 | HH-24 | Déploiement 0.6.2 (Oracle + bureau) | ops | done | v0.6.2 des deux côtés, gateway `active` démarré 13 s après `plugin_api.py` |
 | HH-25 | « Une seule injection par conversation » (session `20261112_065713_213642` : 375 messages, 5 tours utilisateur, 1 bloc `<memory-context>` au 2e tour) — comportement `first_turn`, pas un bug de connexion | plugin-core | done | `mode: every_turn` posé dans `~/.hermes/config.yaml` d'Oracle (backup `config.yaml.bak-everyturns`), gateway redémarré `active` ; à confirmer au prochain tour |
 | HH-26 | À vérifier : dans cette même session, le **premier** tour utilisateur (05:57) n'a reçu aucun bloc, l'injection est arrivée au 2e (06:31) | plugin-core | ready | rejouer un chat neuf avec `mode: every_turn` et lire `gateway.log` + l'audit |
+| HH-27 | Le pane ne montrait qu'une injection : `read_state_db_injections` ne reconnaissait que `<memory-context>` (mesuré : 4 blocs sur 5 messages, 1 reconnu) | plugin-core | done | extraction par marqueur (`memory-context` / `mental-models` / `provider-recall`) ; mesure après déploiement : **4 entrées** pour `20261112_065713_213642` (3 mental-models, 1 memory-context) ; 153 tests ; poussé `091e05e` |
+| HH-28 | Pane : dédoublonnage sur `source+minute` qui fusionnait deux injections, clé React dupliquée, bloc provider-recall qui avalait le bloc mental-models | desktop-ui | done | `kind` dans la clé, clé composite `id:kind`, troncature à `## Stable context (Hindsight` ; 153 tests ; poussé `091e05e` |
+| HH-29 | Déploiement 0.6.3 (Oracle + bureau) | ops | done | v0.6.3 des deux côtés, gateway `active` démarré 14 s après `plugin_api.py` |
 
 <!-- Exemple de ligne (à supprimer au premier vrai item) :
 | HH-1 | Un modèle absent renvoie 404 : le hook crée le modèle une fois puis n'injecte rien au tour courant | plugin-core | ready | pytest tests/test_plugin.py -k create_missing + git diff --stat |

@@ -925,7 +925,7 @@ const VERDICT_VARIANT = {
 }
 
 const rv = {
-  page: { ...styles.root, padding: 0 },
+  page: { ...styles.root, padding: 0, position: 'relative' },
   bar: {
     display: 'flex',
     alignItems: 'center',
@@ -1007,6 +1007,43 @@ const rv = {
     background: 'var(--ui-bg-primary)',
     color: 'var(--ui-text-primary)',
     fontSize: 12
+  },
+  // The "?" glossary: no general Dialog component is exported to plugins, so the
+  // panel is an absolutely-positioned card inside the page, with a click-catching
+  // scrim. The panel itself stops propagation so a click inside does not close it.
+  helpScrim: {
+    position: 'absolute',
+    inset: 0,
+    zIndex: 20,
+    display: 'flex',
+    alignItems: 'flex-start',
+    justifyContent: 'flex-end',
+    padding: 12,
+    background: 'var(--ui-overlay-background)'
+  },
+  helpPanel: {
+    display: 'grid',
+    gap: 10,
+    width: 'min(560px, 100%)',
+    maxHeight: '100%',
+    minHeight: 0,
+    boxSizing: 'border-box',
+    overflow: 'auto',
+    padding: '12px 14px',
+    border: '1px solid var(--ui-stroke-secondary)',
+    borderRadius: 8,
+    background: 'var(--ui-panel-background, var(--ui-bg-primary))',
+    color: 'var(--ui-text-primary)'
+  },
+  helpSection: { display: 'grid', gap: 3 },
+  helpHeading: { fontSize: 11, fontWeight: 600, color: 'var(--ui-text-secondary)' },
+  helpText: { fontSize: 11, lineHeight: 1.5, overflowWrap: 'anywhere' },
+  helpBullets: {
+    margin: 0,
+    paddingLeft: 16,
+    fontSize: 11,
+    lineHeight: 1.5,
+    overflowWrap: 'anywhere'
   }
 }
 
@@ -1164,7 +1201,12 @@ function ReviewRow({
                       : jsx(Button, { type: 'button', size: 'xs', variant: 'secondary', onClick: () => onAction('revoke', item), children: 'Revoke' })
                   ]
                 })
-              : jsx(Badge, { size: 'xs', variant: 'muted', children: 'derived' })
+              : jsx(Badge, {
+                  size: 'xs',
+                  variant: 'muted',
+                  title: 'Observation dérivée : Hindsight la recalcule à partir des autres faits, elle ne peut pas être révoquée.',
+                  children: 'observation · non révocable'
+                })
           })
         ]
       })
@@ -1179,12 +1221,30 @@ function ReviewRow({
 function ReviewCard({ item, verdict, busy, onVerdict }) {
   const invalid = item.state === 'invalidated'
   const cannotRevoke = !item.curatable || invalid
+  // Say why "Faux" is greyed out: a derived observation is not revocable at all,
+  // while an already revoked fact has nothing left to revoke.
+  const revokeTitle = !item.curatable
+    ? 'Observation dérivée : ce fait ne peut pas être révoqué. Seuls les faits world et experience sont curables.'
+    : invalid
+      ? 'Ce fait est déjà révoqué : rien à révoquer ici.'
+      : 'Marquer comme faux et révoquer ce fait'
   return jsxs('section', {
     style: rv.deckCard,
     children: [
       jsx('div', { style: rv.deckText, children: item.text }),
       jsx('div', { style: rv.deckMeta, children: reviewProvenance(item) }),
-      jsx(ReviewBadges, { item, verdict }),
+      jsx(ReviewBadges, {
+        item,
+        verdict,
+        extra: item.curatable
+          ? null
+          : jsx(Badge, {
+              size: 'xs',
+              variant: 'muted',
+              title: 'Observation dérivée : Hindsight la recalcule à partir des autres faits.',
+              children: 'observation · non révocable'
+            })
+      }),
       jsxs('div', {
         style: rv.deckActions,
         children: [
@@ -1198,7 +1258,7 @@ function ReviewCard({ item, verdict, busy, onVerdict }) {
           jsx(Button, {
             type: 'button', size: 'sm', variant: 'secondary',
             disabled: busy || cannotRevoke,
-            title: cannotRevoke ? 'Fait dérivé ou déjà révoqué : non révocable' : 'Marquer comme faux et révoquer ce fait',
+            title: revokeTitle,
             onClick: () => onVerdict('outdated'),
             children: 'Faux'
           }),
@@ -1337,6 +1397,86 @@ function themeOf(item) {
   return 'General'
 }
 
+// The page's own glossary. The numbers here mirror review.py: the age score
+// saturates at AGE_SATURATION_DAYS = 365, the volatile weights are the ones in
+// _VOLATILE_RULES, only CURATABLE_TYPES = ("world", "experience") can be revoked,
+// and a "still true" decision hides a fact for OK_TTL_DAYS = 90 or until its text
+// changes. Keep the two in sync.
+function helpSection(heading, body) {
+  return jsxs('div', {
+    style: rv.helpSection,
+    children: [
+      jsx('div', { style: rv.helpHeading, children: heading }),
+      Array.isArray(body)
+        ? jsx('ul', {
+            style: rv.helpBullets,
+            children: body.map((line, i) => jsx('li', { children: line }, i))
+          })
+        : jsx('div', { style: rv.helpText, children: body })
+    ]
+  })
+}
+
+function ReviewHelpPanel({ onClose }) {
+  return jsxs('div', {
+    role: 'dialog',
+    'aria-modal': 'true',
+    'aria-label': 'Comprendre la revue memoire',
+    style: rv.helpScrim,
+    onClick: onClose,
+    children: [
+      jsxs('div', {
+        style: rv.helpPanel,
+        onClick: event => event.stopPropagation(),
+        children: [
+          jsxs('div', {
+            style: { display: 'flex', alignItems: 'center', gap: 8 },
+            children: [
+              jsx('div', { style: { ...styles.title, flex: 1 }, children: 'Comprendre la revue mémoire' }),
+              jsx(Button, { type: 'button', size: 'xs', variant: 'secondary', onClick: onClose, children: 'Fermer' })
+            ]
+          }),
+          helpSection(
+            'Banques',
+            'hermes est le profil par défaut ; atlas et astro ont chacun la leur. La banque choisie en haut change toute la file : une décision ne traverse pas les banques.'
+          ),
+          helpSection(
+            'État',
+            'valid : le fait est rappelé normalement. revoked : il a été révoqué, mais la révocation est douce (state=invalidated) — le fait reste dans Hindsight pour la traçabilité et n\'est jamais supprimé.'
+          ),
+          helpSection(
+            'Âge : 2 d (1%)',
+            'L\'ancienneté du fait en jours, et son score d\'âge = min(1, jours / 365). 2 jours donnent 1 %, un an ou plus donne 100 %.'
+          ),
+          helpSection(
+            'volatile 100%',
+            'Score de périssabilité du texte, de 0 à 100 % : la somme, plafonnée à 100 %, de URL LAN 35 %, adresse IP 35 %, hash de commit 30 %, numéro de version 25 %, et formule de temps (« actuellement », « en attente », « as of ») 20 %. Survoler le badge liste les marqueurs qui ont déclenché.'
+          ),
+          helpSection(
+            'À revoir',
+            'Nombre de faits de la file dont staleness > 0, après tes décisions « Correct ». staleness = moyenne du score d\'âge et du score de volatilité. Un fait dont le staleness vaut 0 sort de la file.'
+          ),
+          helpSection(
+            'Types de faits',
+            'world : fait stable sur le monde. experience : ce qui s\'est passé, un événement daté. observation : résumé dérivé que Hindsight calcule à partir des autres faits — il se recalcule tout seul. Seuls world et experience sont curables : sur une observation le bouton « Faux » est désactivé, parce qu\'elle suit les faits dont elle dérive.'
+          ),
+          helpSection('Correct / Faux / Je ne sais pas', [
+            'Correct : enregistre la décision localement et sort le fait de la file pendant 90 jours, ou jusqu\'à ce que son texte change. Aucune écriture dans Hindsight.',
+            'Faux : révoque le fait upstream, avec une raison (soft revoke, jamais de suppression).',
+            'Je ne sais pas : laisse le fait dans la file pour plus tard.'
+          ]),
+          helpSection('Améliorer la mémoire', [
+            'Un fait par idée, et daté : « le 3 novembre, X » plutôt que « X » sans date.',
+            'Évite de figer des valeurs qui bougent (port, version, IP) dans un fait durable : préfère « le port est dans la config X ».',
+            'Quand un fait est faux, révoque-le plutôt que de le réécrire : la réécriture le re-embed et jette les observations dérivées.',
+            'Laisse la consolidation Hindsight faire son travail : les observations se recalculent à partir des faits à jour.'
+          ])
+        ]
+      })
+    ]
+  })
+}
+
 function MemoryReviewPage() {
   const [bank, setBank] = useState('hermes')
   const [state, setState] = useState('valid')
@@ -1359,6 +1499,10 @@ function MemoryReviewPage() {
   const [editingId, setEditingId] = useState(null)
   const [editText, setEditText] = useState('')
   const [view, setView] = useState('list')
+  // Page-local filters: whether only the revocable fact types are listed, and the
+  // "?" glossary. Both live in component state only, never in a URL or storage.
+  const [curatableOnly, setCuratableOnly] = useState(false)
+  const [help, setHelp] = useState(false)
   // Session-local bookkeeping for the card deck: ids that already left it (any
   // verdict), and whether the deck was refetched once after running out.
   const [skipped, setSkipped] = useState({})
@@ -1370,7 +1514,10 @@ function MemoryReviewPage() {
 
   const cards = view === 'cards'
   const searchTerm = debouncedSearch
-  const key = [ID, 'review', bank, state, offset, view, searchTerm]
+  const key = [ID, 'review', bank, state, offset, view, searchTerm, curatableOnly]
+  // The backend ignores `curatable_only` when it does not know it, so sending it
+  // unconditionally is safe on an older dashboard.
+  const curatableParam = curatableOnly ? '&curatable_only=1' : ''
 
   // A search runs over the whole bank server-side, so it must not fire on every
   // keystroke: the query key only sees the debounced value.
@@ -1384,8 +1531,8 @@ function MemoryReviewPage() {
     queryFn: () =>
       reviewCall(
         cards
-          ? `/review/${bank}/memories?limit=100&offset=0&state=valid&sort=staleness&review_only=1&q=${encodeURIComponent(searchTerm)}`
-          : `/review/${bank}/memories?limit=100&offset=${offset}&state=${state}&sort=staleness&review_only=0&q=${encodeURIComponent(searchTerm)}`
+          ? `/review/${bank}/memories?limit=100&offset=0&state=valid&sort=staleness&review_only=1&q=${encodeURIComponent(searchTerm)}${curatableParam}`
+          : `/review/${bank}/memories?limit=100&offset=${offset}&state=${state}&sort=staleness&review_only=0&q=${encodeURIComponent(searchTerm)}${curatableParam}`
       ),
     staleTime: 10000,
     retry: 1
@@ -1438,13 +1585,13 @@ function MemoryReviewPage() {
     }
   }
 
-  // A new bank, view or search term starts a fresh deck. `state` and `sort` are
-  // deliberately absent: both selects are list-only and the deck URL hardcodes
-  // them, so they can only clear `skipped` without changing the query.
+  // A new bank, view, search term or type filter starts a fresh deck. `state` and
+  // `sort` are deliberately absent: both selects are list-only and the deck URL
+  // hardcodes them, so they can only clear `skipped` without changing the query.
   useEffect(() => {
     setSkipped({})
     setDeckDone(false)
-  }, [bank, view, searchTerm])
+  }, [bank, view, searchTerm, curatableOnly])
 
   // Deck exhausted: refetch once so the facts just decided leave and the next
   // batch of the queue loads.
@@ -1481,6 +1628,20 @@ function MemoryReviewPage() {
     document.addEventListener('keydown', onKeyDown)
     return () => document.removeEventListener('keydown', onKeyDown)
   }, [cards, card, busy])
+
+  // Escape closes the "?" glossary, like any dialog. The card shortcuts above
+  // stand down while it is open (they bail on any [role="dialog"]).
+  useEffect(() => {
+    if (!help) return undefined
+    const onKeyDown = event => {
+      if (event.key === 'Escape') {
+        event.preventDefault()
+        setHelp(false)
+      }
+    }
+    document.addEventListener('keydown', onKeyDown)
+    return () => document.removeEventListener('keydown', onKeyDown)
+  }, [help])
 
   const submitAdd = async () => {
     const content = newContent.trim()
@@ -1670,6 +1831,14 @@ function MemoryReviewPage() {
             onClick: () => { setView(cards ? 'list' : 'cards'); setOffset(0) },
             children: cards ? 'Liste' : 'Cartes'
           }),
+          jsx(Button, {
+            type: 'button', size: 'xs', variant: curatableOnly ? 'primary' : 'secondary',
+            title: curatableOnly
+              ? 'Afficher tous les types de faits'
+              : 'Ne garder que les faits curables (world, experience), ceux que « Faux » peut révoquer',
+            onClick: () => { setCuratableOnly(v => !v); setOffset(0) },
+            children: 'Curatables seulement'
+          }),
           select(bank, v => { setBank(v); setOffset(0); setSelected({}) }, REVIEW_BANKS.map(b => [b, b])),
           // `state` and `sort` are list-only: the deck's URL hardcodes both.
           cards
@@ -1703,6 +1872,14 @@ function MemoryReviewPage() {
           check
             ? jsx(Button, { type: 'button', size: 'xs', variant: 'ghost', disabled: busy, onClick: () => void readVerdicts(), children: 'Read verdicts' })
             : null,
+          jsx(Button, {
+            type: 'button', size: 'icon-xs', variant: 'ghost',
+            title: 'Comprendre la revue mémoire',
+            'aria-label': 'Aide sur la revue mémoire',
+            'aria-expanded': help,
+            onClick: () => setHelp(v => !v),
+            children: '?'
+          }),
           jsx(Button, {
             type: 'button', size: 'icon-xs', variant: 'ghost', title: 'Refresh', 'aria-label': 'Refresh',
             disabled: query.isFetching, onClick: refresh,
@@ -1777,7 +1954,14 @@ function MemoryReviewPage() {
                         : null,
                       card
                         ? jsx(ReviewCard, { item: card, verdict: verdicts[card.id], busy, onVerdict: decide })
-                        : (query.data?.to_review ?? 0) === 0
+                        : curatableOnly && deckItems.length === 0
+                          // Queue not empty (`to_review > 0`) but nothing curable in
+                          // it: explain the filter instead of claiming the deck ended.
+                          ? jsx(EmptyState, {
+                              title: 'Rien de curable à revoir',
+                              description: 'La file ne contient que des observations dérivées, qui ne se révoquent pas. Désactive « Curatables seulement » pour les voir.'
+                            })
+                          : (query.data?.to_review ?? 0) === 0
                           ? jsx(EmptyState, {
                               title: 'Rien à revoir',
                               description: 'Aucun souvenir de cette banque ne demande de revue.'
@@ -1803,7 +1987,7 @@ function MemoryReviewPage() {
                   style: { ...styles.centered, gap: 10 },
                   children: [
                     truncatedNote,
-                    jsx(EmptyState, { title: 'No facts here', description: 'Nothing to review in this bank and state.' }),
+                    jsx(EmptyState, { title: 'Aucun fait ici', description: 'Rien à revoir dans cette banque et cet état.' }),
                     // Past the scan window the page is empty but the offset is not 0:
                     // keep a way back instead of a dead end.
                     offset > 0
@@ -1867,7 +2051,8 @@ function MemoryReviewPage() {
             onClose: () => setAction(null),
             onDone: done => { setAction(null); setLast(done); setNotice(''); refresh() }
           })
-        : null
+        : null,
+      help ? jsx(ReviewHelpPanel, { onClose: () => setHelp(false) }) : null
     ]
   })
 }

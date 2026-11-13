@@ -353,7 +353,7 @@ def needs_review(item, decisions=None, now=None):
 
 
 def list_review(client, bank, limit=100, offset=0, state="valid", sort="staleness", q="", now=None,
-                *, review_only=False, decisions=None):
+                *, review_only=False, curatable_only=False, decisions=None):
     """Rank a bank's facts globally, then return one ``offset..offset+limit`` slice.
 
     The client scans at most ``MAX_SCAN`` facts in at most ``MAX_CALLS`` upstream
@@ -375,6 +375,13 @@ def list_review(client, bank, limit=100, offset=0, state="valid", sort="stalenes
     here. ``matched`` is the post-filter count (the size of the set ``offset``/
     ``limit`` slice), not a ``q`` match count.
 
+    ``curatable_only`` keeps only the facts whose ``curatable`` is true (the world
+    and experience types; a derived observation cannot be soft-invalidated, so the
+    page's action would be dead). It is applied after the ``review_only``/ledger
+    filter and before sorting and slicing, so ``items``, ``matched`` and the
+    ``offset``/``limit`` window all describe the filtered set. ``to_review`` keeps
+    its meaning: the queue size after the ledger, unaffected by this flag.
+
     ``decisions`` is that bank's local ledger (``{memory_id: decision}``). A fact is
     dropped from the queue once the user marked it ``"still true"`` against the same
     text hash and that decision is younger than ``OK_TTL_DAYS``; any mismatch makes
@@ -394,6 +401,8 @@ def list_review(client, bank, limit=100, offset=0, state="valid", sort="stalenes
     ledger = decisions if isinstance(decisions, dict) else None
     queue = [item for item in scored if needs_review(item, ledger, now)]
     kept = queue if review_only else scored
+    if curatable_only:
+        kept = [item for item in kept if item.get("curatable")]
     ordered = sort_items(kept, sort)
     return {
         "bank": bank,

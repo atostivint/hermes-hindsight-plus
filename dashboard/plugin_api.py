@@ -177,14 +177,16 @@ def review_list(
     sort: str = Query("staleness", max_length=16),
     q: str = Query("", max_length=200),
     review_only: bool = Query(False),
+    curatable_only: bool = Query(False),
 ):
     """Rank a bank's facts across the whole bank (``age``/``volatile``/``staleness``).
 
     ``items`` is the ``offset..offset + limit`` slice of the globally sorted set;
     ``scanned``, ``truncated``, ``matched`` and ``to_review`` describe the scan.
     ``matched`` is the post-filter count and ``to_review`` the queue size after the
-    local ledger, not a ``q`` match count. ``limit`` is capped at
-    ``review.MAX_PAGE``, read at call time (see ``run``).
+    local ledger, not a ``q`` match count. ``curatable_only`` keeps only world and
+    experience facts, which are the ones a soft revoke can act on. ``limit`` is
+    capped at ``review.MAX_PAGE``, read at call time (see ``run``).
     """
     def run():
         review = _review()
@@ -197,7 +199,8 @@ def review_list(
             decisions = _bank_decisions(_read_decisions(), bank)
         return review.list_review(
             _review_client(), bank, limit=limit, offset=offset, state=state, sort=sort,
-            q=q, review_only=review_only, decisions=decisions,
+            q=q, review_only=review_only, curatable_only=curatable_only,
+            decisions=decisions,
         )
 
     return _review_call(run)

@@ -618,8 +618,8 @@ class QueueHindsight:
         self.server.server_close()
 
 
-def _fact(mid, days, text="plain note"):
-    return {"id": mid, "text": text, "state": "valid", "fact_type": "world",
+def _fact(mid, days, text="plain note", fact_type="world"):
+    return {"id": mid, "text": text, "state": "valid", "fact_type": fact_type,
             "date": _iso(days), "invalidation_reason": None}
 
 
@@ -720,6 +720,92 @@ def test_offset_slices_the_ranked_set_not_the_upstream_page(review, queue):
     assert [i["id"] for i in page["items"]] == ["b", "c"]  # raw slice would be a,b
     assert page["offset"] == 1 and page["limit"] == 2
     assert "offset=0" in stub.requests[0]["path"]  # the scan starts at the top of the bank
+
+
+def test_curatable_only_keeps_world_and_experience_over_observations(review, queue):
+    """A derived observation cannot be soft-invalidated, so it is not curatable."""
+    facts = [
+        _fact("obs", 400, fact_type="observation"),
+        _fact("world", 300),
+        _fact("exp", 200, fact_type="experience"),
+    ]
+    _stub, client = queue(facts)
+
+    everything = review.list_review(client, "hermes", now=NOW)
+    queued = review.list_review(client, "hermes", now=NOW, review_only=True)
+    curatable = review.list_review(client, "hermes", now=NOW, curatable_only=True)
+
+    assert everything["matched"] == queued["matched"] == 3
+    assert len(everything["items"]) == len(queued["items"]) == 3
+    assert curatable["matched"] == 2
+    assert [i["id"] for i in curatable["items"]] == ["world", "exp"]
+    assert all(i["curatable"] for i in curatable["items"])
+    # the queue size is the ledger-filtered scan, never narrowed by this flag
+    assert curatable["to_review"] == queued["to_review"] == 3
+    assert curatable["scanned"] == 3
+    assert {i["id"]: i["curatable"] for i in everything["items"]} == {
+        "obs": False, "world": True, "exp": True,
+    }
+
+
+def test_curatable_only_combines_with_review_only(review, queue):
+    """Both filters apply: a stale observation is in the queue but not curatable."""
+    facts = [
+        _fact("obs", 400, fact_type="observation"),
+        _fact("world", 300),
+        _fact("fresh", 0),
+    ]
+    _stub, client = queue(facts)
+
+    assert review.list_review(
+        client, "hermes", now=NOW, review_only=True
+    )["matched"] == 2
+    assert review.list_review(
+        client, "hermes", now=NOW, curatable_only=True
+    )["matched"] == 2  # obs dropped by type, fresh kept without the queue filter
+
+    both = review.list_review(
+        client, "hermes", now=NOW, review_only=True, curatable_only=True
+    )
+    assert both["matched"] == 1
+    assert [i["id"] for i in both["items"]] == ["world"]
+    assert both["to_review"] == 2
+
+
+def test_offset_slices_the_curatable_filtered_set(review, queue):
+    facts = [
+        _fact("obs", 500, fact_type="observation"),  # ranks first, not curatable
+        _fact("a", 400),
+        _fact("b", 300),
+        _fact("c", 200),
+    ]
+    _stub, client = queue(facts)
+
+    page = review.list_review(
+        client, "hermes", limit=2, offset=1, now=NOW, curatable_only=True
+    )
+
+    assert page["matched"] == 3
+    assert [i["id"] for i in page["items"]] == ["b", "c"]  # raw slice would be a,b
+    assert page["offset"] == 1 and page["limit"] == 2
+    assert page["to_review"] == 4
+
+
+def test_curatable_only_default_is_the_unchanged_output(review, queue):
+    facts = [
+        _fact("obs", 400, fact_type="observation"),
+        _fact("world", 300),
+        _fact("fresh", 0),
+    ]
+    _stub, client = queue(facts)
+
+    default = review.list_review(client, "hermes", now=NOW)
+    explicit = review.list_review(client, "hermes", now=NOW, curatable_only=False)
+
+    assert explicit == default
+    assert default["matched"] == 3
+    assert len(default["items"]) == 3
+    assert default["to_review"] == 2
 
 
 def test_q_is_forwarded_upstream_and_never_filtered_here(review, queue):

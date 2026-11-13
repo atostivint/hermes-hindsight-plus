@@ -9,7 +9,7 @@ Inject [Hindsight](https://github.com/vectorize-io/hindsight) **mental models** 
 first turn of every Hermes Agent conversation, so each session starts with stable,
 cron-refreshed context instead of a hand-maintained `MEMORY.md` / `USER.md`.
 
-Version 0.6.3 — MIT.
+Version 0.6.4 — MIT.
 
 ## Why mental models instead of MEMORY.md / USER.md
 
@@ -104,7 +104,9 @@ The opt-in **Memory review** page triages the bank's facts. The list is scored a
 server-side across the whole bank (up to 2,000 facts, at most 40 upstream calls) and reports
 `truncated` when the bank is larger; the "à revoir seulement" view keeps only the facts that are
 stale or volatile. Each fact carries an age score, a volatility score, and the terms that
-tripped it.
+tripped it. The header's **?** button opens an in-app glossary of that vocabulary, and
+**Curatables seulement** keeps only the `world`/`experience` facts, the only ones a soft revoke
+can act on.
 
 **Card mode** shows one fact at a time with three answers, also on ← / → / Space: **Correct**,
 **Faux**, **Je ne sais pas**. Faux soft-invalidates the fact upstream (`PATCH`
