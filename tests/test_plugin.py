@@ -1200,12 +1200,16 @@ def _project_transport(
     project_status=None,
     project_bank=PROJECT_BANK,
     fail=False,
+    bank_list=None,
+    bank_list_status=None,
 ):
     """Transport for the configured bank plus one project bank.
 
     Routes on the exact bank segment, so ``coding-agent::demo-repo`` and
     ``coding-agent::other`` cannot be confused. ``project_status`` simulates a
-    failing project bank (an HTTP status code); ``fail`` makes every call fail.
+    failing project bank (an HTTP status code); ``fail`` makes every call fail;
+    ``bank_list`` answers ``GET /v1/default/banks`` and ``bank_list_status``
+    makes that listing fail.
     """
 
     models = (
@@ -1219,6 +1223,12 @@ def _project_transport(
         calls.append(url)
         if fail:
             raise urllib.error.HTTPError(url, 503, "offline", {}, None)
+        if url.rstrip("/").endswith("/v1/default/banks"):
+            if bank_list_status is not None:
+                raise urllib.error.HTTPError(
+                    url, bank_list_status, "nope", {}, None
+                )
+            return {"banks": [{"bank_id": name} for name in (bank_list or [])]}
         if project_segment in url:
             if project_status is not None:
                 raise urllib.error.HTTPError(url, project_status, "nope", {}, None)
@@ -1693,4 +1703,194 @@ def test_project_from_payload_rejects_host_directories(
         )
         is None
     )
+
+
+# ==== project bank lookup ==================================================
+
+
+def _lookup_config(**overrides):
+    return _make_config(project_bank_lookup=True, **overrides)
+
+
+def test_match_project_bank_exact_id(core):
+    banks = ["hermes", "coding-agent::other"]
+
+    assert core.match_project_bank(banks, "hermes") == "hermes"
+    assert core.match_project_bank(banks, "coding-agent::other") == "coding-agent::other"
+
+
+def test_match_project_bank_ignores_the_coding_agent_prefix(core):
+    banks = ["hermes", "coding-agent::hermes-hindsight-plus"]
+
+    for project in ("hermes-hindsight-plus", "HERMES-HINDSIGHT-PLUS"):
+        assert (
+            core.match_project_bank(banks, project)
+            == "coding-agent::hermes-hindsight-plus"
+        )
+
+
+def test_match_project_bank_slug_ignores_punctuation_and_case(core):
+    banks = ["hermes-hindsight-plus"]
+
+    for project in (
+        "Hermes Hindsight Plus",
+        "hermes_hindsight_plus",
+        "  HERMES   HINDSIGHT-PLUS ",
+        "Hermes.Hindsight.Plus",
+    ):
+        assert core.match_project_bank(banks, project) == "hermes-hindsight-plus"
+
+
+def test_match_project_bank_prefers_a_coding_agent_bank(core):
+    banks = ["hermes-hindsight-plus", "coding-agent::hermes-hindsight-plus"]
+
+    assert (
+        core.match_project_bank(banks, "Hermes Hindsight Plus")
+        == "coding-agent::hermes-hindsight-plus"
+    )
+
+
+def test_match_project_bank_no_match_returns_empty(core):
+    banks = ["hermes", "coding-agent::other"]
+
+    assert core.match_project_bank(banks, "an unrelated repo") == ""
+    assert core.match_project_bank(banks, "") == ""
+    assert core.match_project_bank(banks, "   ") == ""
+    assert core.match_project_bank([], "hermes") == ""
+
+
+def test_lookup_disabled_keeps_the_template_path(
+    plugin, core, monkeypatch, tmp_path
+):
+    _setup_env(monkeypatch, tmp_path)
+    monkeypatch.delenv("HINDSIGHT_PROJECT", raising=False)
+    calls = []
+    monkeypatch.setattr(
+        core,
+        "_http_get_json",
+        _project_transport(calls, bank_list=["hermes", "coding-agent::demo-repo"]),
+    )
+    repo = _repo_dir(tmp_path)
+
+    result = plugin._hook(
+        plugin._State(_project_config()),
+        session_id="ld-1",
+        is_first_turn=True,
+        platform="chat",
+        cwd=str(repo),
+    )
+
+    assert result is not None
+    assert "## Project memory (demo-repo)" in result["context"]
+    # The lookup never runs while the setting is off.
+    assert all(not url.endswith("/v1/default/banks") for url in calls)
+
+
+def test_lookup_resolves_the_bank_from_the_instance_list(
+    plugin, core, monkeypatch, tmp_path
+):
+    _setup_env(monkeypatch, tmp_path)
+    monkeypatch.delenv("HINDSIGHT_PROJECT", raising=False)
+    calls = []
+    monkeypatch.setattr(
+        core,
+        "_http_get_json",
+        _project_transport(calls, bank_list=["hermes", "coding-agent::demo-repo"]),
+    )
+    repo = _repo_dir(tmp_path)
+
+    # No template at all: only the lookup can name the bank.
+    result = plugin._hook(
+        plugin._State(_lookup_config()),
+        session_id="lk-1",
+        is_first_turn=True,
+        platform="chat",
+        cwd=str(repo),
+    )
+
+    assert result is not None
+    text = result["context"]
+    assert "## Project memory (demo-repo)" in text
+    assert "prefer terse code" in text
+    assert any(url.endswith("/v1/default/banks") for url in calls)
+
+
+def test_lookup_falls_back_to_the_template(plugin, core, monkeypatch, tmp_path):
+    _setup_env(monkeypatch, tmp_path)
+    monkeypatch.delenv("HINDSIGHT_PROJECT", raising=False)
+    calls = []
+    monkeypatch.setattr(
+        core, "_http_get_json", _project_transport(calls, bank_list_status=500)
+    )
+    repo = _repo_dir(tmp_path)
+
+    result = plugin._hook(
+        plugin._State(
+            _lookup_config(project_bank_template="coding-agent::{project}")
+        ),
+        session_id="lf-1",
+        is_first_turn=True,
+        platform="chat",
+        cwd=str(repo),
+    )
+
+    assert result is not None
+    assert "## Project memory (demo-repo)" in result["context"]
+    assert "prefer terse code" in result["context"]
+
+
+def test_lookup_failure_leaves_the_injection_intact(
+    plugin, core, monkeypatch, tmp_path
+):
+    _setup_env(monkeypatch, tmp_path)
+    monkeypatch.delenv("HINDSIGHT_PROJECT", raising=False)
+    calls = []
+    monkeypatch.setattr(
+        core, "_http_get_json", _project_transport(calls, bank_list_status=500)
+    )
+    repo = _repo_dir(tmp_path)
+
+    result = plugin._hook(
+        plugin._State(_lookup_config()),
+        session_id="lf-2",
+        is_first_turn=True,
+        platform="chat",
+        cwd=str(repo),
+    )
+
+    assert result is not None
+    assert "remember to be terse" in result["context"]
+    assert "Project memory" not in result["context"]
+
+
+def test_bank_list_cache_is_written_and_used_when_offline(
+    plugin, core, monkeypatch, tmp_path
+):
+    _setup_env(monkeypatch, tmp_path)
+    calls = []
+    monkeypatch.setattr(
+        core,
+        "_http_get_json",
+        _project_transport(calls, bank_list=["hermes", "coding-agent::demo-repo"]),
+    )
+    client = core.HindsightClient("http://localhost:9999", "", "key", 3.0)
+    cache_path = tmp_path / "banks--test.json"
+
+    first = core.list_banks(client, cache_path=cache_path, ttl=21600)
+    assert first == ["hermes", "coding-agent::demo-repo"]
+    assert cache_path.is_file()
+
+    # Fresh cache: no request at all.
+    calls.clear()
+    assert core.list_banks(client, cache_path=cache_path, ttl=21600) == first
+    assert calls == []
+
+    # Stale cache and an unreachable instance: the stale list is used.
+    monkeypatch.setattr(core, "_http_get_json", _project_transport(calls, fail=True))
+    assert core.list_banks(client, cache_path=cache_path, ttl=0) == first
+
+    # No cache at all: no ids, no crash, nothing written.
+    empty_path = tmp_path / "banks--empty.json"
+    assert core.list_banks(client, cache_path=empty_path, ttl=0) == []
+    assert empty_path.is_file() is False
 

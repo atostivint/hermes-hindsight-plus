@@ -520,6 +520,131 @@ def _write_id_list(path, ids):
         _LOG.warning("hindsight-plus: could not write cache %s: %s", path, exc)
 
 
+def _bank_ids_from_list(payload):
+    """Return bank ids from a ``/v1/default/banks`` response.
+
+    Tolerant of the envelope: a bare list, a list of strings, or objects under
+    ``banks`` / ``items`` / ``results`` carrying ``bank_id``, ``id`` or ``name``.
+    Anything else yields no ids.
+    """
+    items = payload
+    if isinstance(items, dict):
+        for key in ("banks", "items", "results"):
+            if isinstance(items.get(key), list):
+                items = items[key]
+                break
+    if isinstance(items, dict):
+        items = [items]
+    if not isinstance(items, list):
+        return []
+    ids = []
+    for item in items:
+        if isinstance(item, dict):
+            value = item.get("bank_id") or item.get("id") or item.get("name")
+        elif isinstance(item, str):
+            value = item
+        else:
+            continue
+        if not isinstance(value, str):
+            continue
+        value = value.strip()
+        if not value or value in ids or not _valid_bank_id(value):
+            continue
+        ids.append(value)
+    return ids
+
+
+def bank_list_cache_path(api_url, hermes_home=None):
+    """Return the on-disk cache path of one instance's bank list."""
+    return _plugin_data_dir(hermes_home) / (
+        f"banks--{_bank_cache_hash(api_url)}.json"
+    )
+
+
+def list_banks(client, cache_path=None, ttl=21600, logger=None):
+    """Return the instance's bank ids, or ``[]``. Never raises.
+
+    Same cache contract as the project id list: a fresh file wins, a failed or
+    unusable refresh falls back to the stale list, and nothing is ever written
+    to Hindsight. Without ``cache_path`` the call is uncached.
+    """
+    logger = logger or _LOG
+    cached = _read_id_list(cache_path) if cache_path is not None else None
+    if cached is not None and cached["ids"] and _is_fresh(cached, ttl):
+        return cached["ids"]
+
+    try:
+        payload = client.list_banks()
+    except (OSError, ValueError) as exc:
+        logger.warning("hindsight-plus: could not list banks: %s", exc)
+        return cached["ids"] if cached is not None else []
+
+    ids = _bank_ids_from_list(payload)
+    if ids:
+        if cache_path is not None:
+            _write_id_list(cache_path, ids)
+        return ids
+    # An empty or unrecognized listing is treated like a failed refresh.
+    return cached["ids"] if cached is not None else []
+
+
+def _bank_tail(bank):
+    prefix = "coding-agent::"
+    text = str(bank)
+    return text[len(prefix):] if text.lower().startswith(prefix) else text
+
+
+def _bank_slug(value):
+    return re.sub(r"[^a-z0-9]+", "-", str(value).lower()).strip("-")
+
+
+def _prefer_coding_agent(matches):
+    for bank in matches:
+        if str(bank).lower().startswith("coding-agent::"):
+            return bank
+    return matches[0] if matches else ""
+
+
+def match_project_bank(banks, project):
+    """Return the bank id matching ``project``, or ``""``.
+
+    Tolerated spellings, in order: an exact id, the exact id after the
+    ``coding-agent::`` prefix (case-insensitive), then a slug comparison where
+    both sides are lowered and every run of non-alphanumerics becomes ``-`` --
+    so ``hermes-hindsight-plus``, ``Hermes Hindsight Plus`` and
+    ``coding-agent::hermes-hindsight-plus`` all match the same bank. A
+    ``coding-agent::`` bank wins when several match, and a bank that is not in
+    ``banks`` is never returned.
+    """
+    if not isinstance(project, str) or not project.strip():
+        return ""
+    if not isinstance(banks, (list, tuple)):
+        return ""
+    names = [bank for bank in banks if isinstance(bank, str) and bank.strip()]
+    if not names:
+        return ""
+    target = project.strip()
+
+    for bank in names:
+        if bank == target:
+            return bank
+
+    lowered = target.lower()
+    tail_hits = [bank for bank in names if _bank_tail(bank).lower() == lowered]
+    chosen = _prefer_coding_agent(tail_hits)
+    if chosen:
+        return chosen
+
+    slug = _bank_slug(target)
+    if not slug:
+        return ""
+    slug_hits = [
+        bank for bank in names
+        if slug in (_bank_slug(bank), _bank_slug(_bank_tail(bank)))
+    ]
+    return _prefer_coding_agent(slug_hits)
+
+
 def _discover_project_model_ids(client, logger, cache_path, ttl):
     """Return the project bank's model ids, on the same cache contract as models.
 
@@ -777,6 +902,14 @@ class HindsightClient:
         url = f"{self.api_url}/v1/default/banks/{bank}/mental-models"
         return _http_get_json(url, remaining, self.api_key)
 
+    def list_banks(self):
+        """Return the instance's bank collection (ids only, never content)."""
+        remaining = self._remaining()
+        if remaining <= 0:
+            raise TimeoutError("Hindsight request budget exhausted")
+        url = f"{self.api_url}/v1/default/banks"
+        return _http_get_json(url, remaining, self.api_key)
+
     def create_model(self, model_id, spec):
         remaining = self._remaining()
         if remaining <= 0:
@@ -886,7 +1019,9 @@ def load_model(model_id, client, cache_path, ttl, logger, create=None):
         return None
 
 
-def build_injection_details(config, logger=None, hermes_home=None, project=None):
+def build_injection_details(
+    config, logger=None, hermes_home=None, project=None, deadline=None
+):
     """Assemble the injection and return its text plus audit metadata.
 
     Returns ``None`` when there is nothing to inject. The text is exactly what
@@ -897,6 +1032,9 @@ def build_injection_details(config, logger=None, hermes_home=None, project=None)
     repository (``{"name": <repo>, "bank": <bank id>}``). Its models are
     appended after the configured bank's, share the same ``max_chars`` budget,
     and are never created: creation stays reserved to the configured bank.
+
+    ``deadline`` (a ``time.monotonic()`` value) lets the caller share one
+    wall-clock budget with an earlier step, such as a project-bank lookup.
     """
     logger = logger or _LOG
     home = pathlib.Path(hermes_home) if hermes_home else _hermes_home()
@@ -916,7 +1054,7 @@ def build_injection_details(config, logger=None, hermes_home=None, project=None)
     cache_ttl_s = _as_int(config.get("cache_ttl_s"), 21600)
     model_ids = _as_list(config.get("mental_model_ids"))
     create = create_spec(config)
-    client = HindsightClient(api_url, bank_id, api_key, timeout_s)
+    client = HindsightClient(api_url, bank_id, api_key, timeout_s, deadline=deadline)
 
     models = []
     model_meta = []
@@ -1017,10 +1155,10 @@ def build_injection_details(config, logger=None, hermes_home=None, project=None)
     return details
 
 
-def build_injection(config, logger=None, hermes_home=None, project=None):
+def build_injection(config, logger=None, hermes_home=None, project=None, deadline=None):
     """Assemble the injection text for the given config, or return None to skip."""
     details = build_injection_details(
-        config, logger=logger, hermes_home=hermes_home, project=project
+        config, logger=logger, hermes_home=hermes_home, project=project, deadline=deadline
     )
     if details is None:
         return None

@@ -1,6 +1,6 @@
 manifest_version: 2
 name: hermes-hindsight-plus
-version: 0.8.0
+version: 0.8.1
 description: >-
   Inject Hindsight mental models into the first turn of every conversation,
   replacing hand-maintained MEMORY.md / USER.md files with stable,
@@ -68,6 +68,16 @@ config_schema:
       while project_bank_template needs a project name from HINDSIGHT_PROJECT or
       the session. Empty defers to the template.
     default: ""
+  project_bank_lookup:
+    type: bool
+    description: >-
+      Resolve the project bank by matching the known project name against the
+      instance's bank list (GET /v1/default/banks) instead of formatting the
+      template. The tolerant alternative to project_bank_template:
+      hermes-hindsight-plus, Hermes Hindsight Plus and
+      coding-agent::hermes-hindsight-plus all match. Disabled by default, and it
+      needs the same project name as the template.
+    default: false
   project_mental_model_ids:
     type: list
     description: >-

@@ -12,6 +12,7 @@ from __future__ import annotations
 import logging
 import os
 import threading
+import time
 
 try:
     from . import core
@@ -50,6 +51,9 @@ DEFAULTS = {
     # Static project bank, used instead of the template. The only route desktop
     # sessions can use: Hermes' pre_llm_call payload carries no cwd.
     "project_bank_id": "",
+    # Tolerant alternative to the template: match the known project name
+    # against the instance's bank list instead of formatting an id.
+    "project_bank_lookup": False,
 }
 
 _logger = logging.getLogger("hermes_hindsight_plus")
@@ -212,7 +216,40 @@ def _payload_name(payload):
     return ""
 
 
-def _project_from_payload(cfg, payload, session_id=None, hermes_home=None):
+def _lookup_bank(cfg, name, hermes_home=None, deadline=None):
+    """Resolve ``name`` against the instance's bank list, or return ``""``.
+
+    Read-only and best-effort: the list is cached on the same terms as the
+    project model ids, and any failure disables the project section instead of
+    affecting the turn.
+    """
+    try:
+        api_url, _bank, api_key = core.resolve_endpoint(
+            hermes_home or core._hermes_home()
+        )
+        if not api_url or not name:
+            return ""
+        client = core.HindsightClient(
+            api_url,
+            "",
+            api_key,
+            core._as_float(cfg.get("timeout_s"), 3.0),
+            deadline=deadline,
+        )
+        banks = core.list_banks(
+            client,
+            cache_path=core.bank_list_cache_path(api_url, hermes_home),
+            ttl=core._as_int(cfg.get("cache_ttl_s"), 21600),
+            logger=_logger,
+        )
+        return core.match_project_bank(banks, name)
+    except Exception:  # noqa: BLE001 - the lookup is optional, never fatal
+        return ""
+
+
+def _project_from_payload(
+    cfg, payload, session_id=None, hermes_home=None, deadline=None
+):
     """Return ``{"name", "bank"}`` for the turn's repository, or ``None``.
 
     Hermes' ``pre_llm_call`` payload carries no working directory, so the path
@@ -220,14 +257,18 @@ def _project_from_payload(cfg, payload, session_id=None, hermes_home=None):
     fill them), ``HINDSIGHT_PROJECT`` (a path or a repo name), and finally the
     ``cwd`` Hermes stored for this session in its read-only ``state.db``. The
     daemon's own directory is never used. A static ``project_bank_id`` needs no
-    path at all - that is the only route a desktop chat can use.
+    path at all, which is what makes it work from a desktop chat where Hermes
+    sends neither a project nor a working directory. With
+    ``project_bank_lookup`` on, the known name is matched against the instance's
+    bank list, and the template is only the fallback.
     """
     try:
         static = cfg.get("project_bank_id")
         template = cfg.get("project_bank_template")
+        lookup = core._as_bool(cfg.get("project_bank_lookup"), False)
         static = static.strip() if isinstance(static, str) else ""
         template = template.strip() if isinstance(template, str) else ""
-        if not static and not template:
+        if not static and not template and not lookup:
             return None
 
         name = _payload_name(payload)
@@ -242,6 +283,10 @@ def _project_from_payload(cfg, payload, session_id=None, hermes_home=None):
 
         if static:
             return {"name": name or static, "bank": static}
+        if lookup and name:
+            bank = _lookup_bank(cfg, name, hermes_home, deadline)
+            if bank:
+                return {"name": name, "bank": bank}
         bank = core.project_bank_id(template, name)
         return {"name": name, "bank": bank} if bank else None
     except Exception:  # noqa: BLE001 - project routing is optional, never fatal
@@ -295,10 +340,18 @@ def _hook(state, session_id=None, task_id=None, turn_id=None, user_message=None,
         if is_first_turn and session_id in state.guard:
             return None
 
+        # One wall-clock budget for the whole attempt, including a bank lookup.
+        deadline = time.monotonic() + max(
+            0.0, core._as_float(cfg.get("timeout_s"), 3.0)
+        )
+
         details = core.build_injection_details(
             cfg,
             _logger,
-            project=_project_from_payload(cfg, kwargs, session_id=session_id),
+            project=_project_from_payload(
+                cfg, kwargs, session_id=session_id, deadline=deadline
+            ),
+            deadline=deadline,
         )
         text = (details or {}).get("text") or ""
         if not text:

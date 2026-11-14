@@ -9,7 +9,7 @@ Inject [Hindsight](https://github.com/vectorize-io/hindsight) **mental models** 
 first turn of every Hermes Agent conversation, so each session starts with stable,
 cron-refreshed context instead of a hand-maintained `MEMORY.md` / `USER.md`.
 
-Version 0.8.0 — MIT.
+Version 0.8.1 — MIT.
 
 ## Why mental models instead of MEMORY.md / USER.md
 
@@ -199,6 +199,7 @@ hermes config set plugins.entries.hermes-hindsight-plus.settings.mode first_turn
 | `context_note`         | `""` | Optional static text injected before the model content. Use it for deployment/architecture facts. Never put secrets here. |
 | `project_bank_template`| `""` | Bank id template resolved per turn; `{project}` is the git repository name, shared across worktrees (e.g. `coding-agent::{project}`). Needs a working directory, which a desktop chat does not carry. Empty disables the project bank. |
 | `project_bank_id`      | `""` | Static project bank id, used instead of the template; needs no working directory, so it works from a desktop chat. Empty defers to the template. |
+| `project_bank_lookup`  | `false` | Resolve the project bank by matching the known project name against the instance's bank list instead of formatting the template. The tolerant alternative to `project_bank_template`. |
 | `project_mental_model_ids` | `[]` | Mental model ids to inject from the project bank, concatenated in order. Empty means every model the project bank returns (at most 16, then bounded by `max_chars`). |
 | `record_content`       | `true` | Keep the injected text and a short user-message preview in the local audit. `false` keeps metadata only. |
 | `audit_max_entries`    | `200` | Maximum injection entries retained across all sessions (1–2000). |
@@ -243,6 +244,23 @@ under `cache_ttl_s`, a cached list and cached models are used when the bank is o
 and a missing bank, a `404` or an invalid bank id is logged and skipped — it never
 delays the turn past `timeout_s`, and **no model is ever created there**. Creation stays
 reserved to the configured bank.
+
+### Lookup mode
+
+`project_bank_lookup: true` replaces the template with a tolerant match: the plugin asks
+the instance for its bank list (`GET /v1/default/banks`), caches it on disk under
+`cache_ttl_s` (a stale copy is used when the instance is unreachable), and picks the bank
+whose id matches the known project name — exact id first, then the id after a
+`coding-agent::` prefix (case-insensitive), then a slug comparison where both sides are
+lowered and every run of non-alphanumerics becomes `-`, so `hermes-hindsight-plus`,
+`Hermes Hindsight Plus` and `coding-agent::hermes-hindsight-plus` all match. A
+`coding-agent::` bank wins when several match, and a bank that is not in the list is
+never returned. The template stays the fallback when the lookup finds nothing, and a
+failed lookup simply leaves the main injection untouched.
+
+The honest limit: the name must still come from the payload path, `HINDSIGHT_PROJECT` or
+the session's stored `cwd`, because Hermes does not send the active project — `projects.db`
+exists but is not consulted and desktop sessions carry no project id.
 
 ## Optimizing for your deployment
 
