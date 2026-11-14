@@ -10,6 +10,7 @@ See README.md for configuration and behaviour.
 from __future__ import annotations
 
 import logging
+import os
 import threading
 
 try:
@@ -42,6 +43,13 @@ DEFAULTS = {
     "create_refresh_cron": core.DEFAULT_CREATE_REFRESH_CRON,
     "create_max_tokens": core.DEFAULT_CREATE_MAX_TOKENS,
     "create_mode": core.DEFAULT_CREATE_MODE,
+    # Optional second, read-only bank for the turn's repository. Empty template
+    # disables the feature; `{project}` is the git repository name.
+    "project_bank_template": "",
+    "project_mental_model_ids": [],
+    # Static project bank, used instead of the template. The only route desktop
+    # sessions can use: Hermes' pre_llm_call payload carries no cwd.
+    "project_bank_id": "",
 }
 
 _logger = logging.getLogger("hermes_hindsight_plus")
@@ -143,6 +151,103 @@ def _get_config(ctx):
     return merged
 
 
+def _normal_path(value):
+    """Return a case-normalized, resolved path string, or ``""``."""
+    try:
+        text = os.path.realpath(os.fspath(value))
+    except (OSError, TypeError, ValueError):
+        return ""
+    return os.path.normcase(text) if text else ""
+
+
+def _blocked_roots():
+    """Directories that are the plugin host's, never a project to route."""
+    roots = []
+    for value in (core._hermes_home(), core._plugin_data_dir()):
+        roots.append(value)
+    roots.append(os.path.dirname(os.path.abspath(__file__)))
+    return roots
+
+
+def _is_blocked_path(value):
+    """True when ``value`` is the Hermes home, the plugin dir or its data dir.
+
+    The gateway's own directory is the known trap: on desktop a chat carries no
+    repository, and the daemon's cwd points at the host installation.
+    """
+    candidate = _normal_path(value)
+    if not candidate:
+        return True
+    return any(candidate == _normal_path(root) for root in _blocked_roots())
+
+
+def _project_name(value):
+    """Return a repository name from a path or a bare repository name.
+
+    A path is resolved through its ``.git`` entry so a worktree maps to the same
+    bank as its main checkout. A value that does not resolve is rejected when it
+    looks like a path, rather than being silently basenamed.
+    """
+    text = value.strip() if isinstance(value, str) else ""
+    if not text or text.startswith("\\\\") or text.startswith("//"):
+        return ""
+    if any(sep in text for sep in ("/", "\\")):
+        if _is_blocked_path(text):
+            return ""
+        return core.repo_name(text)
+    if text in {".", ".."}:
+        return ""
+    return text
+
+
+def _payload_name(payload):
+    """First payload alias that resolves to a project, or ``""``."""
+    for key in ("cwd", "workspace", "workspace_path", "working_directory"):
+        value = payload.get(key)
+        if not isinstance(value, str) or not value.strip():
+            continue
+        name = _project_name(value)
+        if name:
+            return name
+    return ""
+
+
+def _project_from_payload(cfg, payload, session_id=None, hermes_home=None):
+    """Return ``{"name", "bank"}`` for the turn's repository, or ``None``.
+
+    Hermes' ``pre_llm_call`` payload carries no working directory, so the path
+    comes from, in order: the tolerated payload aliases (other transports may
+    fill them), ``HINDSIGHT_PROJECT`` (a path or a repo name), and finally the
+    ``cwd`` Hermes stored for this session in its read-only ``state.db``. The
+    daemon's own directory is never used. A static ``project_bank_id`` needs no
+    path at all - that is the only route a desktop chat can use.
+    """
+    try:
+        static = cfg.get("project_bank_id")
+        template = cfg.get("project_bank_template")
+        static = static.strip() if isinstance(static, str) else ""
+        template = template.strip() if isinstance(template, str) else ""
+        if not static and not template:
+            return None
+
+        name = _payload_name(payload)
+        if not name:
+            name = _project_name(os.environ.get("HINDSIGHT_PROJECT", ""))
+        if not name:
+            name = _project_name(
+                core.read_session_cwd(
+                    session_id or payload.get("session_id"), hermes_home
+                )
+            )
+
+        if static:
+            return {"name": name or static, "bank": static}
+        bank = core.project_bank_id(template, name)
+        return {"name": name, "bank": bank} if bank else None
+    except Exception:  # noqa: BLE001 - project routing is optional, never fatal
+        return None
+
+
 def _broadcast_injection_recorded(summary):
     """Tell an attached Desktop to refresh its memory pane.
 
@@ -190,7 +295,11 @@ def _hook(state, session_id=None, task_id=None, turn_id=None, user_message=None,
         if is_first_turn and session_id in state.guard:
             return None
 
-        details = core.build_injection_details(cfg, _logger)
+        details = core.build_injection_details(
+            cfg,
+            _logger,
+            project=_project_from_payload(cfg, kwargs, session_id=session_id),
+        )
         text = (details or {}).get("text") or ""
         if not text:
             return None

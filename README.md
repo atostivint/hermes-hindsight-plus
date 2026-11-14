@@ -9,7 +9,7 @@ Inject [Hindsight](https://github.com/vectorize-io/hindsight) **mental models** 
 first turn of every Hermes Agent conversation, so each session starts with stable,
 cron-refreshed context instead of a hand-maintained `MEMORY.md` / `USER.md`.
 
-Version 0.7.0 — MIT.
+Version 0.8.0 — MIT.
 
 ## Why mental models instead of MEMORY.md / USER.md
 
@@ -197,6 +197,9 @@ hermes config set plugins.entries.hermes-hindsight-plus.settings.mode first_turn
 | `timeout_s`            | `3.0` | Total wall-clock budget for the whole injection attempt. |
 | `skip_platforms`       | `["cron"]` | Platforms on which no injection happens. |
 | `context_note`         | `""` | Optional static text injected before the model content. Use it for deployment/architecture facts. Never put secrets here. |
+| `project_bank_template`| `""` | Bank id template resolved per turn; `{project}` is the git repository name, shared across worktrees (e.g. `coding-agent::{project}`). Needs a working directory, which a desktop chat does not carry. Empty disables the project bank. |
+| `project_bank_id`      | `""` | Static project bank id, used instead of the template; needs no working directory, so it works from a desktop chat. Empty defers to the template. |
+| `project_mental_model_ids` | `[]` | Mental model ids to inject from the project bank, concatenated in order. Empty means every model the project bank returns (at most 16, then bounded by `max_chars`). |
 | `record_content`       | `true` | Keep the injected text and a short user-message preview in the local audit. `false` keeps metadata only. |
 | `audit_max_entries`    | `200` | Maximum injection entries retained across all sessions (1–2000). |
 | `audit_max_per_session`| `20` | Maximum injection entries retained per session (1–200). |
@@ -210,6 +213,36 @@ hermes config set plugins.entries.hermes-hindsight-plus.settings.mode first_turn
 
 > Hermes parses YAML 1.1, where an unquoted `off` is the boolean `false`. The plugin
 > normalizes both forms, but quoting it (`mode: "off"`) is clearest in `config.yaml`.
+
+### Project banks (opt-in)
+
+Some Hindsight setups keep one bank per code repository (for example
+`coding-agent::<project>`). Three settings add that repository's mental models to the
+injection — `project_bank_template` and `project_bank_id` select the bank,
+`project_mental_model_ids` filters which models to take — read-only, after the configured
+bank's models and inside the same `max_chars` budget.
+
+The repository is resolved from, in order: the hook payload (`cwd`, `workspace`,
+`workspace_path`, `working_directory` — other transports may fill them), the
+`HINDSIGHT_PROJECT` environment variable (a path or a bare repository name), then the
+`cwd` Hermes stored for the session in its `state.db`. Hermes' `pre_llm_call` payload
+carries **no** working directory, and desktop sessions leave `state.db`'s `cwd` empty, so
+**a desktop chat works only with `project_bank_id` alone, or `project_bank_template`
+together with `HINDSIGHT_PROJECT` exported** — the process directory is never used. A
+path is resolved through its `.git` entry, and a worktree is named after the repository
+before `/.git/`, so every worktree maps to the same bank.
+
+Set `project_bank_id` for a fixed bank (`hermes config set
+plugins.entries.hermes-hindsight-plus.settings.project_bank_id coding-agent::my-repo`), or
+`project_bank_template: coding-agent::{project}` when a working directory is available.
+The block appears under `## Project memory (<repo>)`, its model headings are `###`, and
+the text says the facts apply only when working in that repository.
+
+The project bank is read-only: the discovered model id list and the models are cached
+under `cache_ttl_s`, a cached list and cached models are used when the bank is offline,
+and a missing bank, a `404` or an invalid bank id is logged and skipped — it never
+delays the turn past `timeout_s`, and **no model is ever created there**. Creation stays
+reserved to the configured bank.
 
 ## Optimizing for your deployment
 

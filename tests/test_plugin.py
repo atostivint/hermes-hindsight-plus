@@ -1,6 +1,11 @@
 import json
+import os
+import sqlite3
 import urllib.error
+import urllib.parse
 from datetime import datetime, timedelta, timezone
+
+import pytest
 
 NOW = datetime.now(timezone.utc)
 
@@ -1182,3 +1187,510 @@ def test_dashboard_api_reads_the_same_audit(
         assert sessions["sessions"][0]["key"] == "dash-task"
     finally:
         sys.modules.pop("hermes_hindsight_plus_dashboard_core", None)
+
+
+# ==== project bank =========================================================
+
+PROJECT_BANK = "coding-agent::demo-repo"
+
+
+def _project_transport(
+    calls,
+    project_models=None,
+    project_status=None,
+    project_bank=PROJECT_BANK,
+    fail=False,
+):
+    """Transport for the configured bank plus one project bank.
+
+    Routes on the exact bank segment, so ``coding-agent::demo-repo`` and
+    ``coding-agent::other`` cannot be confused. ``project_status`` simulates a
+    failing project bank (an HTTP status code); ``fail`` makes every call fail.
+    """
+
+    models = (
+        {"conventions": "prefer terse code", "decisions": "never PATCH a model"}
+        if project_models is None
+        else project_models
+    )
+    project_segment = f"/banks/{urllib.parse.quote(project_bank, safe='')}/"
+
+    def transport(url, timeout_s, api_key):
+        calls.append(url)
+        if fail:
+            raise urllib.error.HTTPError(url, 503, "offline", {}, None)
+        if project_segment in url:
+            if project_status is not None:
+                raise urllib.error.HTTPError(url, project_status, "nope", {}, None)
+            if url.rstrip("/").endswith("/mental-models"):
+                return {"items": [{"id": name, "name": name} for name in models]}
+            for model_id, content in models.items():
+                encoded = urllib.parse.quote(model_id, safe="")
+                if f"/mental-models/{encoded}?detail=content" in url:
+                    return {
+                        "content": content,
+                        "name": model_id,
+                        "last_refreshed_at": _iso(NOW),
+                        "is_stale": False,
+                    }
+            raise AssertionError(f"unexpected project URL: {url}")
+        if "/banks/bank-1/" in url:
+            if url.rstrip("/").endswith("/mental-models"):
+                return {
+                    "items": [
+                        {"id": "operator-context", "name": "Stable operating context"}
+                    ]
+                }
+            if "/mental-models/operator-context" in url:
+                return {
+                    "content": "remember to be terse",
+                    "name": "Stable operating context",
+                    "last_refreshed_at": _iso(NOW),
+                    "is_stale": False,
+                }
+        raise AssertionError(f"unexpected URL: {url}")
+
+    return transport
+
+
+def _project_config(**overrides):
+    return _make_config(project_bank_template="coding-agent::{project}", **overrides)
+
+
+def _repo_dir(tmp_path, name="demo-repo"):
+    repo = tmp_path / name
+    (repo / ".git").mkdir(parents=True)
+    return repo
+
+
+def test_repo_name_repo_root_and_nested_dir(core, tmp_path):
+    repo = _repo_dir(tmp_path)
+    nested = repo / "src" / "pkg"
+    nested.mkdir(parents=True)
+
+    assert core.repo_name(repo) == "demo-repo"
+    assert core.repo_name(nested) == "demo-repo"
+    assert core.repo_name(repo / ".git" / "HEAD") == "demo-repo"
+
+
+def test_repo_name_from_worktree_git_file(core, tmp_path):
+    repo = _repo_dir(tmp_path, "real-repo")
+    worktree = tmp_path / "feature-worktree"
+    gitdir = repo / ".git" / "worktrees" / "feature"
+    gitdir.mkdir(parents=True)
+    worktree.mkdir()
+    (worktree / ".git").write_text(f"gitdir: {gitdir.as_posix()}\n", "utf-8")
+
+    assert core.repo_name(worktree) == "real-repo"
+
+
+def test_repo_name_from_relative_worktree_gitdir(core, tmp_path):
+    repo = _repo_dir(tmp_path, "real-repo")
+    (repo / ".git" / "worktrees" / "feature").mkdir(parents=True)
+    worktree = tmp_path / "feature"
+    worktree.mkdir()
+    (worktree / ".git").write_text(
+        "gitdir: ../real-repo/.git/worktrees/feature\n", "utf-8"
+    )
+
+    assert core.repo_name(worktree) == "real-repo"
+
+
+def test_repo_name_from_bare_gitdir(core, tmp_path):
+    bare = tmp_path / "srv" / "project.git"
+    bare.mkdir(parents=True)
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    (checkout / ".git").write_text(f"gitdir: {bare.as_posix()}\n", "utf-8")
+
+    assert core.repo_name(checkout) == "project"
+
+
+def test_repo_name_keeps_walking_past_an_unparseable_git_file(core, tmp_path):
+    repo = _repo_dir(tmp_path, "outer-repo")
+    inner = repo / "inner"
+    inner.mkdir()
+    (inner / ".git").write_text("this is not a gitdir line\n", "utf-8")
+
+    assert core.repo_name(inner) == "outer-repo"
+
+
+def test_repo_name_returns_empty_outside_a_repo(core, tmp_path):
+    plain = tmp_path / "not-a-repo"
+    plain.mkdir()
+
+    assert core.repo_name(plain) == ""
+    assert core.repo_name(tmp_path / "missing") == ""
+    assert core.repo_name(None) == ""
+
+
+def test_project_bank_id_substitutes_project_only(core):
+    assert (
+        core.project_bank_id("coding-agent::{project}", "demo-repo")
+        == "coding-agent::demo-repo"
+    )
+    # Only {project} is known to this plugin; other placeholders stay literal.
+    assert (
+        core.project_bank_id("{profile}::{project}", "demo-repo")
+        == "{profile}::demo-repo"
+    )
+    assert (
+        core.project_bank_id("  coding-agent::{project}  ", "demo-repo")
+        == "coding-agent::demo-repo"
+    )
+
+
+def test_project_bank_id_empty_inputs_return_empty(core):
+    assert core.project_bank_id("", "demo-repo") == ""
+    assert core.project_bank_id("   ", "demo-repo") == ""
+    assert core.project_bank_id("coding-agent::{project}", "") == ""
+    assert core.project_bank_id(None, "demo-repo") == ""
+
+
+def test_project_section_appended_when_settings_are_set(
+    plugin, core, monkeypatch, tmp_path
+):
+    _setup_env(monkeypatch, tmp_path)
+    calls = []
+    monkeypatch.setattr(core, "_http_get_json", _project_transport(calls))
+    repo = _repo_dir(tmp_path)
+
+    state = plugin._State(_project_config())
+    result = plugin._hook(
+        state, session_id="p1", is_first_turn=True, platform="chat", cwd=str(repo)
+    )
+
+    assert result is not None
+    text = result["context"]
+    assert "## Project memory (demo-repo)" in text
+    assert text.index("## Stable operating context") < text.index("## Project memory")
+    assert text.index("## Project memory") < text.index("### conventions")
+    assert "These facts apply only when working in demo-repo." in text
+    assert "prefer terse code" in text
+    # The project bank was addressed by the templated id, not the configured one.
+    assert any("/banks/coding-agent%3A%3Ademo-repo/" in url for url in calls)
+
+
+def test_project_section_absent_when_template_is_empty(
+    plugin, core, monkeypatch, tmp_path
+):
+    _setup_env(monkeypatch, tmp_path)
+    calls = []
+    monkeypatch.setattr(core, "_http_get_json", _project_transport(calls))
+    repo = _repo_dir(tmp_path)
+
+    today = core.build_injection(_make_config())
+    result = plugin._hook(
+        plugin._State(_make_config(project_bank_template="")),
+        session_id="p2",
+        is_first_turn=True,
+        platform="chat",
+        cwd=str(repo),
+    )
+
+    assert result is not None
+    assert result["context"] == today
+    assert "Project memory" not in today
+    assert all("coding-agent" not in url for url in calls)
+
+
+def test_project_bank_404_is_swallowed_and_never_creates(
+    plugin, core, monkeypatch, tmp_path
+):
+    _setup_env(monkeypatch, tmp_path)
+    calls = []
+    posts = []
+    monkeypatch.setattr(
+        core, "_http_get_json", _project_transport(calls, project_status=404)
+    )
+
+    def post(url, timeout_s, api_key, payload):
+        posts.append(url)
+        raise AssertionError("the project bank must never be written to")
+
+    monkeypatch.setattr(core, "_http_post_json", post)
+
+    text = core.build_injection(
+        _project_config(project_mental_model_ids=["conventions"]),
+        project={"name": "demo-repo", "bank": PROJECT_BANK},
+    )
+
+    assert text is not None
+    assert "remember to be terse" in text
+    assert "Project memory" not in text
+    assert posts == []
+    # The project bank really was attempted, and refused without a write.
+    assert any("/banks/coding-agent%3A%3Ademo-repo/" in url for url in calls)
+    # A dead project bank leaves the injection exactly as it is today.
+    assert text == core.build_injection(_make_config())
+
+
+def test_project_uses_every_model_when_ids_empty(plugin, core, monkeypatch, tmp_path):
+    _setup_env(monkeypatch, tmp_path)
+    calls = []
+    models = {"conventions": "prefer terse code", "decisions": "never PATCH a model"}
+    monkeypatch.setattr(
+        core, "_http_get_json", _project_transport(calls, project_models=models)
+    )
+
+    details = core.build_injection_details(
+        _project_config(), project={"name": "demo-repo", "bank": PROJECT_BANK}
+    )
+
+    assert details is not None
+    text = details["text"]
+    assert text.count("## Project memory (demo-repo)") == 1
+    assert "### conventions" in text
+    assert "### decisions" in text
+    assert [item["id"] for item in details["project"]["models"]] == [
+        "conventions",
+        "decisions",
+    ]
+    assert details["project"]["bank"] == PROJECT_BANK
+
+
+def test_project_section_respects_max_chars(plugin, core, monkeypatch, tmp_path):
+    _setup_env(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        core,
+        "_http_get_json",
+        _project_transport(
+            [],
+            project_models={
+                "conventions": "short project fact",
+                "decisions": "d" * 1000,
+            },
+        ),
+    )
+
+    details = core.build_injection_details(
+        _project_config(max_chars=600),
+        project={"name": "demo-repo", "bank": PROJECT_BANK},
+    )
+
+    assert details is not None
+    assert details["truncated"] is True
+    assert len(details["text"]) <= 600
+    # The main model body survives; the project block is cut at a section edge.
+    assert "remember to be terse" in details["text"]
+    assert "## Project memory (demo-repo)" in details["text"]
+    assert "### conventions" in details["text"]
+    assert "### decisions" not in details["text"]
+    assert [item["id"] for item in details["project"]["models"]] == ["conventions"]
+    # Never end on a bare heading: the last line is not a group or model heading.
+    assert not details["text"].rstrip().endswith("demo-repo)")
+
+
+def test_project_block_is_dropped_when_no_section_fits(
+    plugin, core, monkeypatch, tmp_path
+):
+    _setup_env(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        core,
+        "_http_get_json",
+        _project_transport([], project_models={"conventions": "c" * 2000}),
+    )
+
+    details = core.build_injection_details(
+        _project_config(max_chars=600),
+        project={"name": "demo-repo", "bank": PROJECT_BANK},
+    )
+
+    assert details is not None
+    assert len(details["text"]) <= 600
+    assert "remember to be terse" in details["text"]
+    assert "## Project memory" not in details["text"]
+    assert "project" not in details
+
+
+def test_project_ids_cached_and_used_offline(plugin, core, monkeypatch, tmp_path):
+    _setup_env(monkeypatch, tmp_path)
+    calls = []
+    monkeypatch.setattr(core, "_http_get_json", _project_transport(calls))
+    # A zero TTL forces every read to refresh, so the second call exercises the
+    # stale fallback instead of a fresh in-TTL hit.
+    config = _project_config(cache_ttl_s=0)
+    project = {"name": "demo-repo", "bank": PROJECT_BANK}
+
+    online = core.build_injection(config, project=project)
+    assert online is not None
+    assert "## Project memory (demo-repo)" in online
+
+    # The bank is now unreachable: the cached id list and model content carry it.
+    monkeypatch.setattr(core, "_http_get_json", _project_transport(calls, fail=True))
+    offline = core.build_injection(config, project=project)
+
+    assert offline is not None
+    assert "## Project memory (demo-repo)" in offline
+    assert "prefer terse code" in offline
+    # The id list was discovered before the outage.
+    assert any(
+        "/banks/coding-agent%3A%3Ademo-repo/mental-models" in url for url in calls
+    )
+
+
+def test_audit_carries_the_project_bank_and_repo(plugin, core, monkeypatch, tmp_path):
+    _setup_env(monkeypatch, tmp_path)
+    monkeypatch.setattr(core, "_http_get_json", _project_transport([]))
+
+    details = core.build_injection_details(
+        _project_config(), project={"name": "demo-repo", "bank": PROJECT_BANK}
+    )
+    assert details is not None
+    core.record_injection(
+        details, _project_config(), session_id="proj-audit", task_id="proj-task"
+    )
+
+    entry = core.read_injection_history("proj-task")["entries"][0]
+    assert entry["project"]["bank"] == PROJECT_BANK
+    assert entry["project"]["repo"] == "demo-repo"
+    assert [item["id"] for item in entry["project"]["models"]] == [
+        "conventions",
+        "decisions",
+    ]
+    # Project headings are '###', so the main model count is not inflated.
+    assert entry["content"].count("## Project memory (demo-repo)") == 1
+    assert "### conventions" in entry["content"]
+
+    # An injection without a project keeps today's entry shape exactly.
+    core.record_injection(
+        _audit_details(), _make_config(), session_id="no-proj", task_id="no-proj-task"
+    )
+    plain = core.read_injection_history("no-proj-task")["entries"][0]
+    assert "project" not in plain
+
+
+@pytest.mark.parametrize("bank", ["a/b", "a b", "../../etc", "é::lin", "::x"])
+def test_invalid_project_bank_ids_are_rejected(
+    plugin, core, monkeypatch, tmp_path, bank
+):
+    _setup_env(monkeypatch, tmp_path)
+    calls = []
+    monkeypatch.setattr(core, "_http_get_json", _project_transport(calls))
+
+    text = core.build_injection(
+        _project_config(), project={"name": "demo-repo", "bank": bank}
+    )
+
+    assert text is not None
+    assert "## Stable operating context" in text
+    assert "Project memory" not in text
+    encoded = urllib.parse.quote(bank, safe="")
+    assert all(encoded not in url for url in calls)
+
+
+def test_static_project_bank_id_needs_no_working_directory(
+    plugin, core, monkeypatch, tmp_path
+):
+    _setup_env(monkeypatch, tmp_path)
+    monkeypatch.delenv("HINDSIGHT_PROJECT", raising=False)
+    calls = []
+    static_bank = "coding-agent::static-bank"
+    monkeypatch.setattr(
+        core, "_http_get_json", _project_transport(calls, project_bank=static_bank)
+    )
+    config = _make_config(
+        project_bank_id=static_bank,
+        project_bank_template="coding-agent::{project}",
+    )
+
+    project = plugin._project_from_payload(config, {}, session_id="static-1")
+    assert project == {"name": static_bank, "bank": static_bank}
+
+    result = plugin._hook(
+        plugin._State(config), session_id="static-1", is_first_turn=True, platform="chat"
+    )
+    assert result is not None
+    assert f"## Project memory ({static_bank})" in result["context"]
+
+
+def test_project_from_payload_reads_each_cwd_alias(plugin, monkeypatch, tmp_path):
+    _setup_env(monkeypatch, tmp_path)
+    monkeypatch.delenv("HINDSIGHT_PROJECT", raising=False)
+    repo = _repo_dir(tmp_path)
+    config = _project_config()
+
+    for index, key in enumerate(
+        ("cwd", "workspace", "workspace_path", "working_directory")
+    ):
+        project = plugin._project_from_payload(
+            config, {key: str(repo)}, session_id=f"alias-{index}"
+        )
+        assert project == {"name": "demo-repo", "bank": PROJECT_BANK}
+
+
+def test_project_from_payload_reads_env_var(plugin, monkeypatch, tmp_path):
+    _setup_env(monkeypatch, tmp_path)
+    repo = _repo_dir(tmp_path)
+    config = _project_config()
+
+    monkeypatch.setenv("HINDSIGHT_PROJECT", str(repo))
+    assert plugin._project_from_payload(config, {}, session_id="env-1") == {
+        "name": "demo-repo",
+        "bank": PROJECT_BANK,
+    }
+
+    # A bare repository name is accepted as-is.
+    monkeypatch.setenv("HINDSIGHT_PROJECT", "my-checkout")
+    assert plugin._project_from_payload(config, {}, session_id="env-2") == {
+        "name": "my-checkout",
+        "bank": "coding-agent::my-checkout",
+    }
+
+
+def test_project_from_payload_reads_state_db_cwd(plugin, monkeypatch, tmp_path):
+    _setup_env(monkeypatch, tmp_path)
+    monkeypatch.delenv("HINDSIGHT_PROJECT", raising=False)
+    repo = _repo_dir(tmp_path)
+    conn = sqlite3.connect(str(tmp_path / "state.db"))
+    conn.execute("CREATE TABLE sessions (session_id TEXT, platform TEXT, cwd TEXT)")
+    conn.execute(
+        "INSERT INTO sessions (session_id, platform, cwd) VALUES (?,?,?)",
+        ("desk-1", "desktop", str(repo)),
+    )
+    conn.execute(
+        "INSERT INTO sessions (session_id, platform, cwd) VALUES (?,?,?)",
+        ("desk-2", "desktop", None),
+    )
+    conn.commit()
+    conn.close()
+
+    assert plugin._project_from_payload(
+        _project_config(), {}, session_id="desk-1"
+    ) == {"name": "demo-repo", "bank": PROJECT_BANK}
+    # A desktop session without a cwd resolves nothing: no project section.
+    assert (
+        plugin._project_from_payload(_project_config(), {}, session_id="desk-2")
+        is None
+    )
+
+
+def test_project_from_payload_rejects_host_directories(
+    plugin, core, monkeypatch, tmp_path
+):
+    _setup_env(monkeypatch, tmp_path)
+    monkeypatch.delenv("HINDSIGHT_PROJECT", raising=False)
+    config = _project_config()
+    plugin_dir = os.path.dirname(os.path.abspath(plugin.__file__))
+    # ``plugin_dir`` really is a git checkout; it must still not name a bank.
+    assert core.repo_name(plugin_dir) == "hermes-hindsight-plus"
+
+    # The daemon's own directory is the known trap.
+    assert (
+        plugin._project_from_payload(config, {"cwd": str(tmp_path)}, session_id="h1")
+        is None
+    )
+    assert (
+        plugin._project_from_payload(
+            config, {"cwd": plugin_dir}, session_id="h2"
+        )
+        is None
+    )
+    # UNC paths are rejected outright.
+    assert (
+        plugin._project_from_payload(
+            config, {"cwd": r"\\server\share\repo"}, session_id="h3"
+        )
+        is None
+    )
+

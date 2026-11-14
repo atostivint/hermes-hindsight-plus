@@ -8,6 +8,7 @@ Stdlib only, no third-party runtime dependency. Target Python 3.11+.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -272,6 +273,343 @@ def resolve_endpoint(hermes_home):
     return (api_url or ""), (bank_id or ""), (api_key or "")
 
 
+# Upper bound on the models pulled from a project bank when the user did not
+# name any. Discovery cannot be bounded by the config the way a configured id
+# list is, and the audit keeps at most 16 model metadata entries anyway;
+# ``max_chars`` still truncates the assembled text.
+PROJECT_MODEL_LIMIT = 16
+
+# A bank id travels in a URL path and names storage on the server, so accept
+# only a conservative shape: 2-128 chars, no ``..`` traversal.
+_BANK_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{1,127}$")
+# A misconfigured template must not warn on every turn; log each distinct bad
+# bank id once (bounded, so an exotic caller cannot grow this without limit).
+_LOGGED_BAD_BANKS = set()
+_LOGGED_BAD_BANKS_MAX = 64
+
+# ``sessions.cwd`` lookups are cached per session id in memory: one read-only
+# query per session, bounded, never raising.
+_SESSION_CWD_CACHE = {}
+_SESSION_CWD_LOCK = threading.Lock()
+SESSION_CWD_CACHE_MAX = 200
+
+
+def _valid_bank_id(value):
+    """True when ``value`` is safe to put in a Hindsight bank URL."""
+    if not isinstance(value, str) or ".." in value:
+        return False
+    return bool(_BANK_ID_RE.match(value))
+
+
+def _log_bad_bank(logger, bank):
+    key = str(bank)[:128]
+    if key not in _LOGGED_BAD_BANKS and len(_LOGGED_BAD_BANKS) < _LOGGED_BAD_BANKS_MAX:
+        _LOGGED_BAD_BANKS.add(key)
+        logger.warning(
+            "hindsight-plus: refusing project bank id %r: use 2-128 chars of "
+            "[A-Za-z0-9._:-] starting alphanumeric, without '..'",
+            key,
+        )
+
+
+def _bank_cache_hash(bank):
+    """Short digest that keeps two project banks from sharing one cache file.
+
+    ``_safe_name`` maps ``:`` and spaces to ``_``, so ``coding-agent::a`` and
+    ``coding-agent a`` would otherwise collide on disk. The configured bank
+    keeps its unhashed filename: it has no sibling, and changing it would throw
+    away every warm cache for no benefit.
+    """
+    return hashlib.sha1(str(bank).encode("utf-8")).hexdigest()[:8]
+
+
+def read_session_cwd(session_id, hermes_home=None):
+    """Return the ``cwd`` Hermes stored for ``session_id``, or ``""``.
+
+    Hermes records it in the ``sessions`` table of its read-only ``state.db``;
+    desktop chats usually leave it empty and only some platforms fill it. One
+    query per session id (cached in memory, bounded), a 2 s timeout, and it
+    never raises. Never writes to the database.
+    """
+    session_id = _clean_id(session_id)
+    if not session_id:
+        return ""
+    with _SESSION_CWD_LOCK:
+        cached = _SESSION_CWD_CACHE.get(session_id)
+    if cached is not None:
+        return cached
+
+    home = pathlib.Path(hermes_home) if hermes_home else _hermes_home()
+    db_path = home / "state.db"
+    value = ""
+    conn = None
+    try:
+        if db_path.is_file():
+            conn = sqlite3.connect(
+                db_path.resolve().as_uri() + "?mode=ro", uri=True, timeout=2.0
+            )
+            try:
+                conn.execute("PRAGMA query_only = ON")
+            except sqlite3.Error:
+                pass
+            for column in ("session_id", "id"):
+                try:
+                    row = conn.execute(
+                        f"SELECT cwd FROM sessions WHERE {column} = ? LIMIT 1",
+                        (session_id,),
+                    ).fetchone()
+                except sqlite3.OperationalError:
+                    continue
+                if row and isinstance(row[0], str):
+                    value = row[0].strip()
+                break
+    except (sqlite3.Error, OSError, ValueError):
+        value = ""
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except sqlite3.Error:
+                pass
+
+    with _SESSION_CWD_LOCK:
+        if len(_SESSION_CWD_CACHE) >= SESSION_CWD_CACHE_MAX:
+            _SESSION_CWD_CACHE.clear()
+        _SESSION_CWD_CACHE[session_id] = value
+    return value
+
+
+def _worktree_repo_name(marker):
+    """Return the repository name from a worktree's ``.git`` file, or ``""``.
+
+    A linked checkout stores ``gitdir: <repo>/.git/worktrees/<name>``; the
+    component before ``/.git/`` is the repository, so every worktree of a
+    repository maps to the same bank.
+    """
+    try:
+        text = marker.read_text("utf-8", errors="replace")
+    except (OSError, ValueError):
+        return ""
+    for line in text.splitlines():
+        head, sep, tail = line.strip().partition(":")
+        if not sep or head.strip().lower() != "gitdir":
+            continue
+        target = tail.strip()
+        if not target:
+            return ""
+        if not os.path.isabs(target):
+            target = os.path.join(str(marker.parent), target)
+        normalized = os.path.normpath(target).replace("\\", "/")
+        cut = normalized.rfind("/.git/")
+        if cut != -1:
+            return normalized[:cut].rstrip("/").rsplit("/", 1)[-1]
+        # A relative ``gitdir`` without a ``worktrees`` segment, or a bare
+        # repository (``<name>.git``): the last component names the repo.
+        tail_name = normalized.rstrip("/").rsplit("/", 1)[-1]
+        if tail_name.endswith(".git"):
+            tail_name = tail_name[: -len(".git")]
+        return tail_name
+    return ""
+
+
+def repo_name(path):
+    """Return the git repository name containing ``path``, or ``""``.
+
+    Walks up looking for a ``.git`` entry, without spawning ``git``: a directory
+    is the repository root, a file is a worktree (see ``_worktree_repo_name``).
+    The path is resolved first so a junction names the real repository, not the
+    link. Read-only, stdlib only, and it never raises.
+    """
+    try:
+        current = pathlib.Path(path).resolve(strict=False)
+        if current.is_file():
+            current = current.parent
+        for candidate in (current, *current.parents):
+            marker = candidate / ".git"
+            if marker.is_dir():
+                return candidate.name or ""
+            if marker.is_file():
+                name = _worktree_repo_name(marker)
+                if name:
+                    return name
+                # Unparseable ``.git`` file: keep walking up, another ancestor
+                # may still be the repository root.
+                continue
+    except (OSError, RuntimeError, TypeError, ValueError):
+        return ""
+    return ""
+
+
+def project_bank_id(template, project):
+    """Return the bank id for ``project``, or ``""`` when either side is empty.
+
+    Only ``{project}`` is substituted. Any other placeholder (``{profile}``) is
+    left literal: this plugin has no notion of it, and inventing one would
+    silently target a bank nobody configured.
+    """
+    if not isinstance(template, str) or not isinstance(project, str):
+        return ""
+    template = template.strip()
+    project = project.strip()
+    if not template or not project:
+        return ""
+    return template.replace("{project}", project)
+
+
+def _model_ids_from_list(payload, limit=PROJECT_MODEL_LIMIT):
+    """Return valid model ids from a mental-models collection response.
+
+    The API wraps collections differently across versions, so accept a bare list
+    and the known envelopes; anything else yields no ids. Ids are filtered
+    through the same shape the plugin requires of a created model.
+    """
+    items = payload
+    if isinstance(items, dict):
+        for key in ("items", "mental_models", "models", "results"):
+            if isinstance(items.get(key), list):
+                items = items[key]
+                break
+    if isinstance(items, dict):
+        items = [items]
+    if not isinstance(items, list):
+        return []
+    ids = []
+    for item in items:
+        if isinstance(item, dict):
+            value = item.get("id") or item.get("mental_model_id")
+        elif isinstance(item, str):
+            value = item
+        else:
+            continue
+        if not isinstance(value, str):
+            continue
+        value = value.strip()
+        if not value or value in ids or not _is_valid_model_id(value):
+            continue
+        ids.append(value)
+        if limit is not None and len(ids) >= limit:
+            break
+    return ids
+
+
+def _read_id_list(path):
+    """Return ``{"fetched_at", "ids"}`` from the id-list cache, or ``None``."""
+    try:
+        data = json.loads(path.read_text("utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    ids = data.get("ids")
+    if not isinstance(ids, list):
+        return None
+    return {
+        "fetched_at": data.get("fetched_at"),
+        "ids": [str(item) for item in ids if str(item).strip()],
+    }
+
+
+def _write_id_list(path, ids):
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps({"fetched_at": _now_iso(), "ids": list(ids)}, ensure_ascii=False),
+            "utf-8",
+        )
+    except OSError as exc:
+        _LOG.warning("hindsight-plus: could not write cache %s: %s", path, exc)
+
+
+def _discover_project_model_ids(client, logger, cache_path, ttl):
+    """Return the project bank's model ids, on the same cache contract as models.
+
+    Fresh cache first; on a failed or unusable refresh, the stale list is used
+    so a remembered project section survives an offline turn. Never raises.
+    """
+    cached = _read_id_list(cache_path)
+    if cached is not None and cached["ids"] and _is_fresh(cached, ttl):
+        return cached["ids"]
+
+    try:
+        payload = client.list_models()
+    except (OSError, ValueError) as exc:
+        logger.warning("hindsight-plus: could not list project bank models: %s", exc)
+        return cached["ids"] if cached is not None else []
+
+    ids = _model_ids_from_list(payload)
+    if ids:
+        _write_id_list(cache_path, ids)
+        return ids
+    # An empty or unrecognized listing is treated like a failed refresh: the
+    # cached ids are better than silently losing a section that exists.
+    return cached["ids"] if cached is not None else []
+
+
+def _load_project_block(config, client, cache_dir, cache_ttl_s, logger):
+    """Return ``(model_ids, sections, metadata)`` read from the project bank.
+
+    Read-only: every failure is logged and skipped, and ``create`` stays unset
+    so a 404 here can never become a POST. Section headings use ``###`` to sit
+    under the group heading, and each section is a whole unit for truncation.
+    """
+    bank = str(client.bank_id)
+    requested = _as_list(config.get("project_mental_model_ids"))
+    if requested:
+        candidates = requested
+    else:
+        list_path = cache_dir / (
+            f"id-list--{_safe_name(bank)}-{_bank_cache_hash(bank)}.json"
+        )
+        candidates = _discover_project_model_ids(client, logger, list_path, cache_ttl_s)
+
+    ids = []
+    sections = []
+    meta = []
+    for model_id in candidates:
+        cache_path = cache_dir / (
+            f"{_safe_name(bank)}-{_bank_cache_hash(bank)}--{_safe_name(model_id)}.json"
+        )
+        model = load_model(
+            model_id, client, cache_path, cache_ttl_s, logger, create=None
+        )
+        if model is None:
+            continue
+        content = (model.get("content") or "").strip()
+        if not content:
+            continue
+        ids.append(model_id)
+        stale_age = model.get("_stale_cache_age")
+        meta.append(
+            {
+                "id": model_id,
+                "name": str(model.get("name") or model_id),
+                "last_refreshed_at": _json_scalar(model.get("last_refreshed_at")),
+                "is_stale": bool(model.get("is_stale")),
+                "cache_age_s": (
+                    _as_int(stale_age, 0) if stale_age is not None else None
+                ),
+                "content_chars": len(content),
+            }
+        )
+        sections.append(f"### {model.get('name') or model_id}\n\n{content}")
+    return ids, sections, meta
+
+
+def _fit_project_block(prefix, group, sections, max_chars):
+    """Append whole project sections to ``prefix`` while they fit.
+
+    Returns ``(text, kept)``. A section is never cut mid-way, and the group
+    heading is never left alone: when nothing fits, ``text == prefix``.
+    """
+    kept = len(sections)
+    while kept > 0:
+        candidate = "\n\n".join([prefix, group, *sections[:kept]])
+        if len(candidate) <= max_chars:
+            return candidate, kept
+        kept -= 1
+    return prefix, 0
+
+
 def create_spec(config):
     """Return the create-if-missing spec, or ``None`` when creation is disabled.
 
@@ -339,6 +677,12 @@ def _is_fresh(record: dict, ttl) -> bool:
     return age < ttl
 
 
+def _truncation_marker(model_ids) -> str:
+    ids = ", ".join(str(i) for i in model_ids)
+    label = "mental model" if len(model_ids) == 1 else "mental models"
+    return f"[... truncated — full {label}: {ids}]"
+
+
 def truncate(text: str, max_chars: int, model_ids) -> str:
     """Truncate ``text`` at the last complete line that fits within ``max_chars``
     and append a marker line. The final string (including the marker) never
@@ -347,9 +691,7 @@ def truncate(text: str, max_chars: int, model_ids) -> str:
     if len(text) <= max_chars:
         return text
 
-    ids = ", ".join(str(i) for i in model_ids)
-    label = "mental model" if len(model_ids) == 1 else "mental models"
-    marker = f"[... truncated — full {label}: {ids}]"
+    marker = _truncation_marker(model_ids)
 
     # If the marker cannot fit, honour the hard cap and skip it.
     if len(marker) + 1 >= max_chars:
@@ -399,12 +741,16 @@ class HindsightClient:
     budget. Requests still fall back to the on-disk cache on failure.
     """
 
-    def __init__(self, api_url, bank_id, api_key, timeout_s):
+    def __init__(self, api_url, bank_id, api_key, timeout_s, deadline=None):
         self.api_url = (api_url or "").rstrip("/")
         self.bank_id = bank_id
         self.api_key = api_key
         self.timeout_s = timeout_s
-        self._deadline = time.monotonic() + max(0.0, float(timeout_s or 0.0))
+        # ``deadline`` lets a second client (the project bank) share the
+        # configured wall-clock budget instead of getting a fresh one.
+        if deadline is None:
+            deadline = time.monotonic() + max(0.0, float(timeout_s or 0.0))
+        self._deadline = deadline
 
     def _remaining(self):
         return max(0.0, self._deadline - time.monotonic())
@@ -420,6 +766,15 @@ class HindsightClient:
             f"{self.api_url}/v1/default/banks/{bank}"
             f"/mental-models/{model}?detail=content"
         )
+        return _http_get_json(url, remaining, self.api_key)
+
+    def list_models(self):
+        """Return the bank's mental-model collection (metadata only, no content)."""
+        remaining = self._remaining()
+        if remaining <= 0:
+            raise TimeoutError("Hindsight request budget exhausted")
+        bank = urllib.parse.quote(str(self.bank_id), safe="")
+        url = f"{self.api_url}/v1/default/banks/{bank}/mental-models"
         return _http_get_json(url, remaining, self.api_key)
 
     def create_model(self, model_id, spec):
@@ -531,12 +886,17 @@ def load_model(model_id, client, cache_path, ttl, logger, create=None):
         return None
 
 
-def build_injection_details(config, logger=None, hermes_home=None):
+def build_injection_details(config, logger=None, hermes_home=None, project=None):
     """Assemble the injection and return its text plus audit metadata.
 
     Returns ``None`` when there is nothing to inject. The text is exactly what
     ``pre_llm_call`` returns; the extra fields let the audit record describe
     what was injected without re-fetching or re-assembling anything.
+
+    ``project`` optionally names a second, read-only bank for the turn's
+    repository (``{"name": <repo>, "bank": <bank id>}``). Its models are
+    appended after the configured bank's, share the same ``max_chars`` budget,
+    and are never created: creation stays reserved to the configured bank.
     """
     logger = logger or _LOG
     home = pathlib.Path(hermes_home) if hermes_home else _hermes_home()
@@ -587,6 +947,30 @@ def build_injection_details(config, logger=None, hermes_home=None):
         logger.warning("hindsight-plus: no mental model content available; injecting nothing")
         return None
 
+    # Optional second bank, read-only. Every failure below is swallowed so the
+    # configured-bank injection is unaffected.
+    project = project if isinstance(project, dict) else None
+    project_name = ""
+    project_bank = ""
+    project_ids = []
+    project_sections = []
+    project_meta = []
+    project_kept = 0
+    if project and project.get("bank"):
+        project_bank = str(project["bank"])
+        project_name = str(project.get("name") or project_bank)
+        if not _valid_bank_id(project_bank):
+            # Never put an unsafe id in a URL; the section is simply disabled.
+            _log_bad_bank(logger, project_bank)
+            project_bank = ""
+        else:
+            project_client = HindsightClient(
+                api_url, project_bank, api_key, timeout_s, deadline=client._deadline
+            )
+            project_ids, project_sections, project_meta = _load_project_block(
+                config, project_client, cache_dir, cache_ttl_s, logger
+            )
+
     max_chars = max(1, min(_as_int(config.get("max_chars"), 6000), HERMES_CALLBACK_CAP))
     note = str(config.get("context_note") or "").strip()
     parts = [build_header(models)]
@@ -594,20 +978,50 @@ def build_injection_details(config, logger=None, hermes_home=None):
         parts.append(note)
     parts.extend(sections)
     text = "\n\n".join(parts)
-    injected = truncate(text, max_chars, model_ids)
-    return {
+    injected = truncate(text, max_chars, model_ids + project_ids)
+    truncated = len(injected) < len(text)
+
+    # The project block is assembled whole: a section is never cut mid-way and
+    # the group heading never stands alone. When the main text already fills the
+    # budget (or no section fits), the injection is byte-identical to today's.
+    if project_sections and not truncated:
+        group = (
+            f"## Project memory ({project_name})\n\n"
+            f"These facts apply only when working in {project_name}."
+        )
+        fitted, project_kept = _fit_project_block(
+            injected, group, project_sections, max_chars
+        )
+        if project_kept:
+            injected = fitted
+            if project_kept < len(project_sections):
+                truncated = True
+                marker = _truncation_marker(model_ids + project_ids)
+                if len(injected) + 1 + len(marker) <= max_chars:
+                    injected = injected + "\n" + marker
+
+    details = {
         "text": injected,
         "assembled_chars": len(text),
         "max_chars": max_chars,
-        "truncated": len(injected) < len(text),
+        "truncated": truncated,
         "context_note_chars": len(note),
         "models": model_meta,
     }
+    if project_kept:
+        details["project"] = {
+            "bank": project_bank,
+            "repo": project_name,
+            "models": project_meta[:project_kept],
+        }
+    return details
 
 
-def build_injection(config, logger=None, hermes_home=None):
+def build_injection(config, logger=None, hermes_home=None, project=None):
     """Assemble the injection text for the given config, or return None to skip."""
-    details = build_injection_details(config, logger=logger, hermes_home=hermes_home)
+    details = build_injection_details(
+        config, logger=logger, hermes_home=hermes_home, project=project
+    )
     if details is None:
         return None
     return details.get("text") or None
@@ -766,6 +1180,22 @@ def _audit_model_metadata(models) -> list[dict]:
             }
         )
     return result
+
+
+def _audit_project_metadata(project):
+    """Bounded, content-free view of the project bank that was injected."""
+    if not isinstance(project, dict):
+        return None
+    bank = str(project.get("bank") or "").strip()
+    repo = str(project.get("repo") or "").strip()
+    models = _audit_model_metadata(project.get("models"))
+    if not bank and not repo and not models:
+        return None
+    return {
+        "bank": bank[:128],
+        "repo": repo[:128],
+        "models": models,
+    }
 
 
 def _user_preview(value) -> str:
@@ -941,6 +1371,11 @@ def record_injection(
                 ),
                 "models": _audit_model_metadata(details.get("models")),
             }
+            project_meta = _audit_project_metadata(details.get("project"))
+            if project_meta:
+                # Present only when a project section was actually injected, so
+                # an entry without one keeps today's shape exactly.
+                entry["project"] = project_meta
             entries = bucket.setdefault("entries", [])
             entries.append(entry)
             bucket["last_recorded_at"] = now

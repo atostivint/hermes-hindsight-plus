@@ -1,6 +1,6 @@
 manifest_version: 2
 name: hermes-hindsight-plus
-version: 0.7.0
+version: 0.8.0
 description: >-
   Inject Hindsight mental models into the first turn of every conversation,
   replacing hand-maintained MEMORY.md / USER.md files with stable,
@@ -50,6 +50,30 @@ config_schema:
       deployment facts (instance, profiles, architecture) that should always be
       present. Empty by default. Do not put secrets here.
     default: ""
+  project_bank_template:
+    type: str
+    description: >-
+      Bank id template resolved per turn; {project} is the git repository name,
+      shared across worktrees; example coding-agent::{project}. The name comes from
+      HINDSIGHT_PROJECT, a payload path when the transport provides one, or the
+      session's stored cwd; a desktop chat has no working directory of its own. The
+      project bank is read-only and appended after the configured bank's models.
+      Empty disables the feature.
+    default: ""
+  project_bank_id:
+    type: str
+    description: >-
+      Static project bank id used instead of the template when set: it needs no
+      working directory at all, which is what makes it usable from a desktop chat,
+      while project_bank_template needs a project name from HINDSIGHT_PROJECT or
+      the session. Empty defers to the template.
+    default: ""
+  project_mental_model_ids:
+    type: list
+    description: >-
+      Mental model ids to inject from the project bank, concatenated in order; empty
+      means every model the project bank returns (bounded by the existing caps).
+    default: []
   record_content:
     type: bool
     description: >-
