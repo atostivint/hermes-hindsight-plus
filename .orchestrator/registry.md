@@ -25,8 +25,13 @@ longer matches the files under SCOPE (e.g. it was working on `review.py` and the
 
 ## Last release
 
-`0.7.0` - `origin/main` = `e2ed7ad`, deployed on oracle + this Windows host by
-`scripts/deploy.ps1 -Target all -RestartApi`; gateway restarted 14 s after `plugin_api.py`.
+`0.8.0` - `origin/main` = `51d7245`, deployed on oracle + this Windows host by
+`scripts/deploy.ps1 -Target all -RestartApi`; gateway restarted 13 s after `plugin_api.py`.
+Adds the opt-in project bank (`project_bank_template`, `project_bank_id`,
+`project_mental_model_ids`): read-only, appended after the configured bank, with the model
+id list cached on disk. Desktop chats carry no cwd (113/114 rows), so only
+`project_bank_id` (static, per profile) or `project_bank_template` + `HINDSIGHT_PROJECT`
+can give them repository context.
 
 ## Open decisions (see inbox.md)
 
