@@ -25,13 +25,14 @@ longer matches the files under SCOPE (e.g. it was working on `review.py` and the
 
 ## Last release
 
-`0.8.0` - `origin/main` = `51d7245`, deployed on oracle + this Windows host by
-`scripts/deploy.ps1 -Target all -RestartApi`; gateway restarted 13 s after `plugin_api.py`.
-Adds the opt-in project bank (`project_bank_template`, `project_bank_id`,
-`project_mental_model_ids`): read-only, appended after the configured bank, with the model
-id list cached on disk. Desktop chats carry no cwd (113/114 rows), so only
-`project_bank_id` (static, per profile) or `project_bank_template` + `HINDSIGHT_PROJECT`
-can give them repository context.
+`0.8.1` - `origin/main` = `de8db29`, deployed on oracle + this Windows host by
+`scripts/deploy.ps1 -Target all -RestartApi`; gateway restarted 14 s after `plugin_api.py`.
+Project bank: `project_bank_id` (static), `project_bank_template` (`{project}`) and
+`project_bank_lookup` (name matched against `GET /v1/default/banks`), all opt-in and read-only.
+Verified live on oracle: 53 banks, `hermes-hindsight-plus` and `Hermes Hindsight Plus` both
+resolve to `coding-agent::hermes-hindsight-plus`, an unknown name resolves to nothing.
+Desktop chats still carry no cwd (113/114 rows), so only the static id or an exported
+`HINDSIGHT_PROJECT` gives them repository context.
 
 ## Open decisions (see inbox.md)
 
